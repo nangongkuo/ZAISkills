@@ -126,29 +126,30 @@ Edit 报告文件直接改这几处。
 
 ## 命令 4: `publish.sh`
 
-**作用**: 推 `report.md` 到语雀。**幂等**: 同 package 重跑只 update，不重复建文档。
+**作用**: 推 `report.md` 到飞书文档。**幂等**: 同 package 重跑只 overwrite，不重复建文档。
 
 ```bash
-bash $SKILL_DIR/scripts/publish.sh <package> [--namespace <ns>] [--no-yuque]
+bash $SKILL_DIR/scripts/publish.sh <package> [--parent-token <token>] [--parent-position <pos>] [--no-feishu]
 ```
 
 ### 参数
 
 - `<package>` - 必填，APK 包名（如 `com.taobao.taobao`）
-- `--namespace <ns>` - 可选，覆盖 `config.json` 的 `default_namespace`（默认 `lingxi.mly/dbqqab`）
-- `--no-yuque` - 跳过推送，仅返回本地 `report.md` 路径
+- `--parent-token <token>` - 可选，覆盖 `config.json` 的 `default_parent_token`
+- `--parent-position <pos>` - 可选，发布到飞书预置位置（与 `--parent-token` 互斥）
+- `--no-feishu` - 跳过推送，仅返回本地 `report.md` 路径
 
 ### 行为
 
 1. 读 `~/.apk-reverse/reports/<package>/report.md`
-2. 查 `~/.apk-reverse/state/<package>.json` 的 slug
-3. 有 slug -> `yuque update doc <ns/slug>`
-4. 无 slug -> `yuque create doc` + 把返回的 slug 写回 state
-5. 自动 `--upload-images --yes` 处理截图
+2. 查 `~/.apk-reverse/state/<package>.json` 的飞书文档 URL / document_id
+3. 有同一发布位置的文档记录 -> `lark-cli docs +update --command overwrite`
+4. 无文档记录 -> `lark-cli docs +create` + 把返回的 document_id / URL 写回 state
+5. 默认发布到 `config.json` 中的飞书 `default_parent_token`
 
 ### 输出
 
-最后一行 stdout = 语雀 URL。
+最后一行 stdout = 飞书文档 URL。
 
 ---
 
@@ -173,7 +174,7 @@ bash $SKILL/scripts/render.sh $WD
 
 # (Claude 用 Edit 把 TL;DR / §4 关键发现 / §5 建议 改成实际结论)
 
-# 4. 发语雀
+# 4. 发飞书文档
 bash $SKILL/scripts/publish.sh com.taobao.taobao
 ```
 
@@ -193,9 +194,9 @@ bash $SKILL/scripts/publish.sh com.taobao.taobao
 | `spawn` 模式竞态 / `attach` 后进程被杀退出 | APP 有 Frida 检测 / 启动期杀进程 | 见下方“延时 Attach 策略” |
 | `hook` 后 CPU 100%，所有回调失效 | `Process.setExceptionHandler` 被异常洪泛阻塞 | 绝对不要用 `Process.setExceptionHandler`；异常密集型 APP 会占满 JS 线程 |
 | `render.sh` 大响应不在 `evidence/bodies` | label 命名含特殊字符 | 查 `reassemble_body.py` log 列出的 label 是否符合规则 |
-| `publish.sh` 报 401 | yuque 未登录 / token 过期 | `yuque whoami`；必要时重新认证 |
-| `publish.sh` 报图片上传失败 | 语雀图床偶发 503，或单张图过大被拒（>10MB） | 重试；或压缩过大的截图 |
-| `publish.sh` 每次都新建文档不复用 | `state.json` namespace 不匹配 | 检查 `cat ~/.apk-reverse/state/<pkg>.json` |
+| `publish.sh` 报未授权 / 权限不足 | lark-cli 用户未登录、token 过期或缺少飞书文档权限 | 按报错提示执行 `lark-cli auth login --scope <scope>` |
+| `publish.sh` 每次都新建文档不复用 | `state.json` 中的飞书发布位置与本次参数不匹配 | 检查 `cat ~/.apk-reverse/state/<pkg>.json` |
+| `publish.sh` 报父目录无权限 | 当前身份无法在目标飞书文件夹创建文档 | 确认 `--as user` 已登录且对 folder token 有编辑权限 |
 
 ## 进阶用法
 
@@ -218,7 +219,7 @@ bash $SKILL/scripts/analyze.sh $APK --skip-decompile
 # meta.json + runtime_mods.json 立得，不反编译
 ```
 
-### 强制重新建语雀文档
+### 强制重新建飞书文档
 
 ```bash
 rm ~/.apk-reverse/state/<pkg>.json

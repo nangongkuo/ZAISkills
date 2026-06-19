@@ -1,6 +1,6 @@
 ---
 name: apk-reverse-skill
-description: 一键自动化 Android APK 逆向分析。用户说“分析/逆向 xxx APK 代码”、“分析/逆向 xxx 技术链路/实现方案”时触发。一键自动化 + MASTG 风格报告 + 语雀同步
+description: 一键自动化 Android APK 逆向分析。用户说“分析/逆向 xxx APK 代码”、“分析/逆向 xxx 技术链路/实现方案”时触发。一键自动化 + MASTG 风格报告 + 飞书文档同步
 human-name: APK 逆向分析
 owner: 凌逸
 model: sonnet
@@ -9,10 +9,10 @@ allowed-tools: [Bash, Read, Write, Edit, Agent, TaskCreate, TaskUpdate, AskUserQ
 
 # APK 逆向分析 v3
 
-**一键自动化** + **MASTG 风格报告** + **语雀等同步**
+**一键自动化** + **MASTG 风格报告** + **飞书文档同步**
 
 > 输入: 1 个 APK 路径
-> 输出: 1 份语雀文档 + 本地 `~/.apk-reverse/reports/<pkg>/`
+> 输出: 1 份飞书文档 + 本地 `~/.apk-reverse/reports/<pkg>/`
 
 ## 触发条件
 
@@ -38,7 +38,7 @@ allowed-tools: [Bash, Read, Write, Edit, Agent, TaskCreate, TaskUpdate, AskUserQ
 1. analyze.sh <apk> [--task <task>]        # T1+T2 全自动（必跑）
 2. dynamic.sh <workdir> <round_id>         # T3，按需调（可多轮）
 3. render.sh <workdir>                     # 聚合渲染单个 MASTG 报告（必跑）
-4. publish.sh <pkg> [--namespace ns]       # 推语雀（幂等：首次 create，后续 update）
+4. publish.sh <pkg> [--parent-token token] # 推飞书文档（幂等：首次 create，后续 overwrite）
 ```
 
 详细见 `PLAYBOOK.md`。
@@ -83,7 +83,7 @@ Claude: "请在模拟器：[具体步骤，由 task 决定]。做完回复 done�
 Claude: Edit report.md 把 §4 关键发现 / §5 建议 / TL;DR 改成实际分析结论
   ↓
 4. bash $SKILL_DIR/scripts/publish.sh <pkg>
-   -> 语雀 URL
+   -> 飞书文档 URL
 ```
 
 ## 证据标注
@@ -108,7 +108,7 @@ Claude: Edit report.md 把 §4 关键发现 / §5 建议 / TL;DR 改成实际分
 │       ├── screenshots/round-N-{before,after}.png
 │       ├── logs/round-N.log
 │       └── bodies/round-N/*.txt
-├── state/<package>.json        <- yuque slug 记忆
+├── state/<package>.json        <- feishu document_id/url 记忆
 └── knowledge/                  <- 跨会话沉淀（可选）
 
 /tmp/apk-reverse-<pkg>-<ts>/    <- 临时工作目录（不持久！完成后必须备份到项目目录）
@@ -121,7 +121,7 @@ Claude: Edit report.md 把 §4 关键发现 / §5 建议 / TL;DR 改成实际分
 3. Tier 标在报告 §1 头部
 4. 大响应（>10KB）一律用 `H.dumpString/dumpBytes` 分段输出 + `reassemble_body.py` 拼回
 5. 模拟器交互前先 `bash scripts/lib/emu.sh keep-awake`
-6. 同一 APK 多次调用 `publish.sh` 的 slug 记忆，**不重复建文档**
+6. 同一 APK 多次调用 `publish.sh` 的飞书文档记忆，**不重复建文档**
 7. 动态阶段最多问用户 1 次（要不要做 T3）；之后每轮明确告知“请做 XX，做完回复 done”
 8. **不**自动点屏幕（用户在模拟器手动）
 9. Native VMP 默认不还原，只列入口 + 推测用途，用户明确要求再反编译；
@@ -137,7 +137,7 @@ Claude: Edit report.md 把 §4 关键发现 / §5 建议 / TL;DR 改成实际分
 ## 文件索引
 
 - `PLAYBOOK.md` - 详细操作手册（每个命令的参数 + 输出 + 排错）
-- `config.json` - 任务关键字 / yuque 默认 namespace / static-grep 模式
+- `config.json` - 任务关键字 / 飞书默认发布目录 / static-grep 模式
 - `templates/report.md.tpl` - MASTG 报告模板
 - `templates/tasks/*.md` - 5 个 task 特化分析指南
 - `scripts/`
@@ -153,11 +153,11 @@ Claude: Edit report.md 把 §4 关键发现 / §5 建议 / TL;DR 改成实际分
 
 ## 用户使用指南维护
 
-本 skill 配套一份用户使用指南，发布在语雀:
+本 skill 配套一份用户使用指南，发布在飞书文档:
 
-- **URL**: https://yuque.antfin.com/lingxi.mly/dbqqab/qlzc7t1sg6da501g
+- **URL**: 记录在 `~/.apk-reverse/state/_guide.json` 的 `guide.feishu.url`
 - **本地源**: `~/.apk-reverse/GUIDE.md`
-- **Slug 记忆**: `~/.apk-reverse/state/_guide.json`
+- **文档记忆**: `~/.apk-reverse/state/_guide.json`
 
 **任何 skill 变更（新增脚本 / 改命令参数 / 改默认行为）后，MUST 执行**:
 
@@ -167,4 +167,4 @@ Claude: Edit report.md 把 §4 关键发现 / §5 建议 / TL;DR 改成实际分
    bash $SKILL_DIR/scripts/update_guide.sh
    ```
 
-会自动 update 同一 slug，URL 不变。
+会自动 overwrite 同一飞书文档，URL 不变。

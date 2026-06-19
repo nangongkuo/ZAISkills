@@ -9,9 +9,9 @@
     "state_root": "~/.apk-reverse/state"
   },
 
-  "yuque": {
-    "default_namespace": "lingxi.mly/dbqqab",
-    "upload_images": true
+  "feishu": {
+    "default_parent_token": "V7vgft281lqwyzduWHNcd2vHnoe",
+    "default_parent_position": ""
   },
 
   "packer_strategies": {

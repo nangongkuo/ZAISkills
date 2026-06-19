@@ -55,6 +55,7 @@ test_l0() {
     local required_files=(
         "SKILL.md" "PLAYBOOK.md" "config.json"
         "scripts/analyze.sh" "scripts/dynamic.sh" "scripts/render.sh" "scripts/publish.sh"
+        "scripts/update_guide.sh"
         "scripts/lib/_common.sh" "scripts/lib/extract_meta.sh" "scripts/lib/runtime_mods.sh"
         "scripts/lib/decompile.sh" "scripts/lib/emu.sh" "scripts/lib/run_frida.py"
         "scripts/lib/reassemble_body.py" "scripts/lib/unpack.sh"
@@ -78,7 +79,7 @@ test_l0() {
     # L0.2 Bash 脚本语法
     echo " --- Bash 语法 ---"
     for f in scripts/lib/_common.sh scripts/lib/unpack.sh scripts/lib/decompile.sh \
-        scripts/analyze.sh scripts/dynamic.sh scripts/publish.sh; do
+        scripts/analyze.sh scripts/dynamic.sh scripts/publish.sh scripts/update_guide.sh; do
         if bash -n "$SKILL_DIR/$f" 2>/dev/null; then
             check "$f bash 语法" "pass"
         else

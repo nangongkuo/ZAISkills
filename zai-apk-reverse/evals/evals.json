@@ -107,18 +107,18 @@
     },
     {
       "id": 7,
-      "prompt": "把 xxx.apk 的逆向分析报告发布到语雀，namespace 用 lingxi.mly/dbqqab",
-      "expected_output": "执行 render.sh 生成最终报告，再执行 publish.sh --namespace lingxi.mly/dbqqab 推送语雀。首次 create 返回 URL，后续 update 同一 slug 保持 URL 不变",
+      "prompt": "把 xxx.apk 的逆向分析报告发布到飞书文档，使用默认飞书文件夹",
+      "expected_output": "执行 render.sh 生成最终报告，再执行 publish.sh 推送飞书文档。首次 create 返回 URL，后续 overwrite 同一文档保持 URL 不变",
       "files": [
         "report.md",
         "~/.apk-reverse/state/<pkg>.json"
       ],
       "expectations": [
         "render.sh 先于 publish.sh 执行，确保 report.md 最新",
-        "publish.sh 首次创建返回语雀文档 URL",
-        "state/<pkg>.json 记录 yuque namespace + slug 用于幂等",
+        "publish.sh 首次创建返回飞书文档 URL",
+        "state/<pkg>.json 记录 feishu parent_token + document_id/url 用于幂等",
         "同一 APK 多次执行 publish.sh 不重复创建文档",
-        "publish.sh 成功后输出最终语雀 URL"
+        "publish.sh 成功后输出最终飞书文档 URL"
       ]
     }
   ]
