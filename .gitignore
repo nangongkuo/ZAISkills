@@ -1,0 +1,20 @@
+.DS_Store
+.idea/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Local environment
+.env
+.env.*
+
+# Common caches and build outputs
+.cache/
+node_modules/
+dist/
+build/
+target/
+__pycache__/
+*.py[cod]

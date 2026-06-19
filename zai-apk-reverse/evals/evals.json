@@ -1,0 +1,125 @@
+{
+  "skill_name": "apk-reverse-skill",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "分析 /path/to/xhs.apk 看视频详情页加速链路和首屏 RPC",
+      "expected_output": "执行 analyze.sh --task first-screen-rpc，完成 T1(APK画像) + T2(静态分析) 后，输出 meta.json + static_findings.json + report.md，报告应包含：组件统计、exported 攻击面、RPC 端点、加密算法、关键类映射。若有加固识别则标注 T1-only 并建议动态阶段",
+      "files": [
+        "meta.json",
+        "static_findings.json",
+        "report.md",
+        "decision-log.md"
+      ],
+      "expectations": [
+        "成功执行 analyze.sh 并输出 workdir 路径",
+        "meta.json 包含包名、版本、SDK范围、权限、组件统计等基础画像",
+        "static_findings.json 包含 rpc_endpoints/sign_headers/crypto_algos/hardcoded_keys 中的至少2项",
+        "decision-log.md 记录加固检测结果和应对策略",
+        "report.md 包含 TL;DR 和至少 §1 APK画像 + §2 静态分析章节"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "帮我分析 xxx.apk 的 H5 容器和预加载机制",
+      "expected_output": "执行 analyze.sh --task h5-container，识别 WebView 容器类(SYSTEM/MECO 双内核)、JSBridge 方法注册、shouldInterceptRequest 拦截逻辑、ParallelHtml/RRP 预加载系统，输出含类映射表和加载链路的报告",
+      "files": [
+        "meta.json",
+        "static_findings.json",
+        "report.md"
+      ],
+      "expectations": [
+        "使用 --task h5-container 参数调用 analyze.sh",
+        "识别出 WebView 容器类型（SYSTEM内核/MECO内核/双内核）",
+        "定位 JSBridge 注册类和 callNative 方法",
+        "分析 shouldInterceptRequest 拦截和预请求注入机制",
+        "报告中包含主文档加载链路时序描述"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "逆向分析 xxx.apk 的 DeepLink 路由和 scheme 入口",
+      "expected_output": "执行 analyze.sh --task deeplink，提取 scheme/intent-filter 声明、路由分发类（SchemeJumper/UIRouter）、DeepLink 注册表，输出 DeepLink 攻击面分析",
+      "files": [
+        "meta.json",
+        "static_findings.json",
+        "report.md"
+      ],
+      "expectations": [
+        "使用 --task deeplink 参数调用 analyze.sh",
+        "从 AndroidManifest.xml 提取所有 scheme 和 intent-filter 声明",
+        "定位路由分发类和跳转逻辑",
+        "识别 exported Activity 的 DeepLink 入口和安全风险",
+        "报告中包含 DeepLink 攻击面章节"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "分析 xxx.apk 做安全审计，看有没有权限滥用和明文 key",
+      "expected_output": "执行 analyze.sh --task security-audit，输出 dangerous 权限列表、exported 组件攻击面、明文密钥/API Key、签名验证漏洞、Network Security Config 分析",
+      "files": [
+        "meta.json",
+        "static_findings.json",
+        "report.md"
+      ],
+      "expectations": [
+        "使用 --task security-audit 参数调用 analyze.sh",
+        "列出所有 dangerous 级别权限并评估影响",
+        "分析 exported 组件数量和潜在攻击面",
+        "static_findings.json 包含 hardcoded_keys 检测结果",
+        "报告包含安全态势总结和修复建议"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "分析 xxx.apk 的 Native JNI 加密逻辑，定位 so 文件入口",
+      "expected_output": "执行 analyze.sh --task native-jni，定位 so 文件、JNI 入口函数（NativeRegister/RegisterNatives）、加密算法调用点，默认只列入口+推测用途不还原 VMP 算法",
+      "files": [
+        "meta.json",
+        "static_findings.json",
+        "report.md",
+        "runtime_mods.json"
+      ],
+      "expectations": [
+        "使用 --task native-jni 参数调用 analyze.sh",
+        "枚举所有 so 文件并按大小排序",
+        "runtime_mods.json 包含 vmp_indicators 和 dynamic_loader 检测结果",
+        "定位 JNI_OnLoad 和 RegisterNatives 入口",
+        "报告中标注“不自动还原 VMP，仅定位入口”的边界声明"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "分析完 xxx.apk 后做 T3 动态 hook，想看看首页 RPC 调用的真实时序",
+      "expected_output": "先通过 analyze.sh 完成 T1+T2，询问用户是否做 T3 后执行 dynamic.sh round-1，输出 findings/round-1.json + evidence/logs/round-1.log + evidence/screenshots/round-1-before/after.png，用户按指示操作模拟器后 Claude 读取日志并分析真实时序",
+      "files": [
+        "findings/round-1.json",
+        "evidence/logs/round-1.log",
+        "report.md"
+      ],
+      "expectations": [
+        "analyze.sh 完成后用 AskUserQuestion 询问是否做 T3",
+        "dynamic.sh 执行前告知用户模拟器操作步骤",
+        "dynamic.sh 输出 round-1.json 和 round-1.log",
+        "Claude 读取日志后按 grep 先于 read 原则分析时序",
+        "render.sh 将动态发现合并到最终 report.md"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "把 xxx.apk 的逆向分析报告发布到语雀，namespace 用 lingxi.mly/dbqqab",
+      "expected_output": "执行 render.sh 生成最终报告，再执行 publish.sh --namespace lingxi.mly/dbqqab 推送语雀。首次 create 返回 URL，后续 update 同一 slug 保持 URL 不变",
+      "files": [
+        "report.md",
+        "~/.apk-reverse/state/<pkg>.json"
+      ],
+      "expectations": [
+        "render.sh 先于 publish.sh 执行，确保 report.md 最新",
+        "publish.sh 首次创建返回语雀文档 URL",
+        "state/<pkg>.json 记录 yuque namespace + slug 用于幂等",
+        "同一 APK 多次执行 publish.sh 不重复创建文档",
+        "publish.sh 成功后输出最终语雀 URL"
+      ]
+    }
+  ]
+}

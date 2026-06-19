@@ -1,0 +1,114 @@
+{
+  "_comment": "zai-apk-reverse 全局配置。analyze.sh / dynamic.sh / render.sh / publish.sh 都读这里。",
+
+  "paths": {
+    "workdir_root": "/tmp",
+    "reports_root": "~/.apk-reverse/reports",
+    "indexes_root": "~/.apk-reverse/indexes",
+    "knowledge_root": "~/.apk-reverse/knowledge",
+    "state_root": "~/.apk-reverse/state"
+  },
+
+  "yuque": {
+    "default_namespace": "lingxi.mly/dbqqab",
+    "upload_images": true
+  },
+
+  "packer_strategies": {
+    "_comment": "加固类型 → 自动脱壳策略映射。full=DEX整体加密(90%+), partial=抽取型(需预热), java_only=DEX可脱JNI不可达, vmp_only=仅签名级, manual=不支持自动",
+    "360加固": "full",
+    "爱加密": "full",
+    "百度加固": "full",
+    "DexProtector": "full",
+    "腾讯乐固": "full",
+    "御安全": "full",
+    "梆梆加固": "partial",
+    "梆梆": "partial",
+    "网易易盾": "partial",
+    "易盾": "partial",
+    "阿里聚安全": "java_only",
+    "libfakejni": "java_only",
+    "拼多多自研": "java_only",
+    "libpdd_secure": "java_only",
+    "libpinduoduo_secure": "java_only"
+  },
+
+  "vendor_profiles": {
+    "_comment": "厂商 profile: 不同厂商的关键字和 frida 脚本覆盖。--vendor bytedance 切换。",
+    "alibaba": {
+      "class_keywords": ["mtop", "anet", "MtopBuilder", "MtopResponse", "WindVane", "Themis", "PHA", "Atlas", "Tinker"],
+      "string_keywords": ["mtop.taobao", "mtop.alibaba", "arkact", "windvane", "x-sign", "x-mini-wua"],
+      "frida_scripts": ["trace_mtop.js"]
+    },
+    "bytedance": {
+      "class_keywords": ["SSSocket", "TTEncrypt", "ApiHandler", "Lynx", "TTWebView", "Kite", "AwemeNetworkApi", "SSNetwork"],
+      "string_keywords": ["/aweme/v1/", "/i18ea/", "X-Gorgon", "X-Khronos", "X-Ladon", "X-SS-ReqTicket", "lynx://"],
+      "frida_scripts": ["bytedance/trace_aweme.js", "bytedance/trace_lynx.js"]
+    },
+    "pinduoduo": {
+      "class_keywords": ["PDDApplicationLike", "MainFrameActivity", "NewPageActivity", "HttpCall", "SecureNative", "LegoView"],
+      "string_keywords": ["/api/alexa/", "pinduoduo.com", "yangkeduo", "lego://", "unifySetup"],
+      "frida_scripts": ["pinduoduo/trace_pdd_rpc.js"]
+    },
+    "tencent": {
+      "class_keywords": ["HttWebView", "HippyContainer", "WeChat", "MiniProgram", "UniMP", "QQNetwork"],
+      "string_keywords": ["wx://", "mqq://", "hippy://", "weixin://"],
+      "frida_scripts": []
+    }
+  },
+
+  "task_keywords": {
+    "_comment": "task → grep 关键字 + 默认 Frida 脚本组合",
+
+    "first-screen-rpc": {
+      "class_keywords": ["mtop", "anet", "MtopBuilder", "MtopResponse", "homepage", "firstscreen", "newface", "splash", "welcome"],
+      "string_keywords": ["mtop.taobao", "mtop.alibaba", "first.page", "homepage", "splash"],
+      "frida_scripts": ["_common.js", "00_bootstrap.js", "trace_mtop.js", "trace_lifecycle.js"]
+    },
+    "h5-container": {
+      "class_keywords": ["WebView", "WindVane", "pha", "themis", "lynx", "weex", "TMSActivity", "PreRender"],
+      "string_keywords": ["arkact", "windvane", "WVApi", "loadUrl"],
+      "frida_scripts": ["_common.js", "00_bootstrap.js", "trace_mtop.js"]
+    },
+    "deeplink": {
+      "class_keywords": ["Intent", "Uri", "scheme", "DeepLink", "Schema", "Router"],
+      "string_keywords": ["scheme=", "android.intent.action.VIEW"],
+      "frida_scripts": ["_common.js", "00_bootstrap.js", "trace_deeplink.js"]
+    },
+    "security-audit": {
+      "class_keywords": ["Application", "Provider", "Permission", "Crypto", "Cipher", "KeyStore"],
+      "string_keywords": ["API_KEY", "SECRET", "TOKEN", "AES/", "HmacSHA"],
+      "frida_scripts": ["_common.js", "00_bootstrap.js", "trace_lifecycle.js"]
+    },
+    "native-jni": {
+      "class_keywords": ["JNI", "native", "System.loadLibrary"],
+      "string_keywords": ["RegisterNatives", "JNI_OnLoad"],
+      "frida_scripts": ["_common.js", "00_bootstrap.js", "trace_jni.js"]
+    }
+  },
+
+  "static_grep_patterns": {
+    "_comment": "通用静态分析 grep 模式（写入 static_findings.json）",
+    "rpc_endpoints": "mtop\\.[a-z]+\\.[a-z][a-zA-Z0-9._]+|https?://[a-zA-Z0-9.-]+/[a-zA-Z0-9._/?=-]+",
+    "sign_headers": "x-sign|x-mini-wua|X-Argus|X-Gorgon|X-Khronos|X-Ladon|anti-content|mtop-sign|wua",
+    "crypto_algos": "AES/[A-Z]+/[A-Za-z]+Padding|HmacSHA[0-9]+|RSA/[A-Z]+/[A-Za-z]+Padding",
+    "hardcoded_keys": "(API_KEY|SECRET|TOKEN|APPKEY|appkey|password)\\s*=\\s*\"[A-Za-z0-9+/=_-]{8,}\""
+  },
+
+  "frida": {
+    "default_duration_sec": 60,
+    "runtime": "v8",
+    "script_load_order": ["lib/_common.js", "lib/_anti_detect.js", "00_bootstrap.js"],
+    "_comment_script_load_order": "所有动态分析都先加载这三个脚本，再加 task 特定脚本"
+  },
+
+  "dynamic_loader_patterns": [
+    "com.android.alibaba.ip.runtime.IpChange",
+    "com.alipay.dexaop.Chain",
+    "com.tencent.tinker",
+    "com.meituan.robust",
+    "com.alipay.sophix",
+    "DexClassLoader",
+    "PathClassLoader"
+  ]
+}
