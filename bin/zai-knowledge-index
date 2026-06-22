@@ -1,0 +1,999 @@
+#!/usr/bin/env node
+/**
+ * ACS Knowledge Index CLI
+ * 轻量知识索引工具 - 支持扫描、同步、上传
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
+
+// ========== 默认配置 ==========
+
+// 默认远程知识仓库地址（可通过 --remote、环境变量、配置文件覆盖）
+const DEFAULT_REMOTE_URL = 'git@code.alipay.com:kangwenhao.kwh/acs-common-knowledge.git';
+
+// 远端 project knowledge 仓库地址
+const DEFAULT_PROJECT_REMOTE_URL = 'git@code.alipay.com:kangwenhao.kwh/acs-project-knowledge.git';
+
+// 使用远端 project knowledge 的仓库白名单（新增仓库在此追加）
+const PROJECT_REMOTE_REPOS = [
+  'ios-phone-homecard',
+  'android-phone-homefeeds-git',
+];
+
+// ========== 工具函数 ==========
+
+// 解析 frontmatter（支持扁平和 meta: 嵌套两种格式）
+// 扁平格式: name: xxx / keywords: [a, b]
+// 嵌套格式: meta:\n  name: xxx\n  keywords: [a, b]
+function parseFrontmatter(content) {
+  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  if (!match) return null;
+
+  const lines = match[1].split('\n');
+  const meta = {};
+  let inMeta = false;
+
+  for (const line of lines) {
+    // 检测 meta: 嵌套块
+    if (/^meta:\s*$/.test(line)) {
+      inMeta = true;
+      continue;
+    }
+
+    // 嵌套块中的缩进行
+    if (inMeta && /^\s+/.test(line)) {
+      const trimmed = line.trim();
+      const colonIdx = trimmed.indexOf(':');
+      if (colonIdx > 0) {
+        const key = trimmed.slice(0, colonIdx).trim();
+        let value = trimmed.slice(colonIdx + 1).trim();
+        // 解析 [a,b,c] 数组格式为逗号分隔字符串
+        if (value.startsWith('[') && value.endsWith(']')) {
+          value = value.slice(1, -1);
+        }
+        meta[key] = value;
+      }
+      continue;
+    }
+
+    // 非缩进行结束嵌套块
+    if (inMeta && !/^\s/.test(line) && line.trim()) {
+      inMeta = false;
+    }
+
+    // 扁平格式
+    const colonIdx = line.indexOf(':');
+    if (colonIdx > 0) {
+      const key = line.slice(0, colonIdx).trim();
+      let value = line.slice(colonIdx + 1).trim();
+      if (value.startsWith('[') && value.endsWith(']')) {
+        value = value.slice(1, -1);
+      }
+      meta[key] = value;
+    }
+  }
+
+  return meta;
+}
+
+// 从正文提取 ## Scanned Repos 章节中的仓库名列表
+function parseScannedRepos(content) {
+  const match = content.match(/##\s*Scanned Repos\n([\s\S]*?)(?=\n##\s|\n---|\s*$)/);
+  if (!match) return [];
+  return match[1]
+    .split('\n')
+    .map(line => line.replace(/^[-*]\s*/, '').trim())
+    .filter(Boolean);
+}
+
+// 获取远程仓库地址（优先级：参数，环境变量，默认值）
+function getRemoteUrl(cliOption) {
+  if (cliOption) return cliOption;
+  if (process.env.ACS_COMMON_KNOWLEDGE_URL) return process.env.ACS_COMMON_KNOWLEDGE_URL;
+  return DEFAULT_REMOTE_URL;
+}
+
+// 获取 project knowledge 远端地址
+function getProjectRemoteUrl() {
+  if (process.env.ACS_PROJECT_KNOWLEDGE_URL) return process.env.ACS_PROJECT_KNOWLEDGE_URL;
+  return DEFAULT_PROJECT_REMOTE_URL;
+}
+
+// 从 git remote URL 提取仓库名
+function getRepoName(repoPath) {
+  try {
+    const url = exec(`git -C "${repoPath}" remote get-url origin`).trim();
+    const match = url.match(/\/([^/]+?)(?:\.git)?$/);
+    return match ? match[1] : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 扫描单个目录
+function scanDir(dirPath, source) {
+  if (!fs.existsSync(dirPath)) return [];
+
+  const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.md'));
+  const items = [];
+
+  for (const file of files) {
+    const filePath = path.join(dirPath, file);
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const meta = parseFrontmatter(content);
+
+    if (meta) {
+      items.push({
+        id: meta.id || path.basename(file, '.md'),
+        title: meta.title || meta.name || file,
+        description: meta.description || '',
+        keywords: (meta.keywords || '').split(',').map(s => s.trim()).filter(Boolean),
+        path: file,
+        source,
+        scannedRepos: parseScannedRepos(content),
+      });
+    }
+  }
+
+  return items;
+}
+
+// 检测平台
+function detectPlatform(repoPath) {
+  const files = fs.readdirSync(repoPath);
+  // KMP: 有 shared/src/commonMain 或 composeApp 目录
+  if (fs.existsSync(path.join(repoPath, 'shared', 'src', 'commonMain')) || files.includes('composeApp')) return 'KMP';
+  // HarmonyOS: 有 oh-package.json5 或 entry/src/main/ets
+  if (files.includes('oh-package.json5') || fs.existsSync(path.join(repoPath, 'entry', 'src', 'main', 'ets'))) return 'HarmonyOS';
+  if (fs.existsSync(path.join(repoPath, 'build.gradle'))) return 'Android';
+  if (files.some(f => f.endsWith('.xcodeproj'))) return 'iOS';
+  return 'unknown';
+}
+
+// 标准化平台名称（保持标准大小写）
+function normalizePlatform(platform) {
+  const lower = platform.toLowerCase();
+  if (lower === 'ios') return 'iOS';
+  if (lower === 'android') return 'Android';
+  if (lower === 'kmp') return 'KMP';
+  if (lower === 'harmonyos' || lower === 'harmony') return 'HarmonyOS';
+  return platform; // 保持原样
+}
+
+// 执行 shell 命令
+function exec(cmd, options = {}) {
+  try {
+    return execSync(cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], ...options });
+  } catch (e) {
+    if (options.ignoreError) return null;
+    throw e;
+  }
+}
+
+// ========== 核心命令 ==========
+
+// scan 命令
+function scan(repoPath, options = {}) {
+  const platform = options.platform === 'auto' ? detectPlatform(repoPath) : (options.platform || 'unknown');
+
+  const repoKnowledgeDir = path.join(repoPath, 'knowledge', 'project');
+  const commonKnowledgeDir = path.join(repoPath, 'knowledge', 'common', normalizePlatform(platform));
+
+  const repoKnowledge = scanDir(repoKnowledgeDir, 'repo');
+  const commonKnowledge = scanDir(commonKnowledgeDir, 'common');
+
+  // 计算知识状态
+  const totalCount = repoKnowledge.length + commonKnowledge.length;
+  let status = 'complete';
+  let warning = null;
+  if (totalCount === 0) {
+    status = 'empty';
+    warning = '未检测到知识文档，spec 阶段将使用默认能力';
+  } else if (repoKnowledge.length === 0 || commonKnowledge.length === 0) {
+    status = 'partial';
+  }
+
+  const result = {
+    platform,
+    generatedAt: new Date().toISOString(),
+    repoKnowledgePath: repoKnowledgeDir,
+    commonKnowledgePath: commonKnowledgeDir,
+    repoKnowledge,
+    commonKnowledge,
+    status,
+    warning,
+  };
+
+  if (options.output) {
+    fs.mkdirSync(path.dirname(options.output), { recursive: true });
+    fs.writeFileSync(options.output, JSON.stringify(result, null, 2));
+  }
+
+  console.log(`✅ 知识索引生成完成：${repoKnowledge.length} 条仓库知识，${commonKnowledge.length} 条通用知识（平台：${platform}）`);
+  if (warning) {
+    console.log(`⚠️  警告：${warning}`);
+  }
+  return result;
+}
+
+// sync 命令：从远程仓库拉取知识
+function sync(repoPath, options = {}) {
+  const remoteUrl = getRemoteUrl(options.remote);
+  const platform = options.platform === 'auto' ? detectPlatform(repoPath) : (options.platform || 'unknown');
+  const localCommonDir = path.join(repoPath, 'knowledge', 'common', normalizePlatform(platform));
+
+  // 创建临时目录拉取远程仓库
+  const tmpDir = path.join(repoPath, '.acs-tmp', 'remote-knowledge');
+
+  try {
+    // 清理并创建临时目录
+    if (fs.existsSync(tmpDir)) {
+      exec(`rm -rf "${tmpDir}"`);
+    }
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    // 克隆远程仓库（浅克隆，只取最新）
+    console.log('📥 正在从远程仓库同步知识...');
+    console.log(`远程：${remoteUrl}`);
+    exec(`git clone --depth 1 "${remoteUrl}" "${tmpDir}"`);
+
+    // 检查远程知识目录（支持两种结构：knowledge/common/iOS 或 common/iOS）
+    let remotePlatformDir = path.join(tmpDir, 'knowledge', 'common', normalizePlatform(platform));
+    if (!fs.existsSync(remotePlatformDir)) {
+      // 尝试简化结构：common/iOS
+      remotePlatformDir = path.join(tmpDir, 'common', normalizePlatform(platform));
+    }
+
+    if (!fs.existsSync(remotePlatformDir)) {
+      console.log(`⚠️  远程仓库中没有 ${platform} 平台的知识文档`);
+      exec(`rm -rf "${tmpDir}"`);
+
+      // 即使 common 平台目录不存在，白名单仓库仍需同步 project knowledge
+      const repoName = getRepoName(repoPath);
+      if (repoName && PROJECT_REMOTE_REPOS.includes(repoName)) {
+        syncProject(repoPath, { remote: getProjectRemoteUrl() });
+      }
+
+      return { synced: 0, conflicts: [] };
+    }
+
+    // 确保本地目录存在
+    if (!fs.existsSync(localCommonDir)) {
+      fs.mkdirSync(localCommonDir, { recursive: true });
+    }
+
+    // 增量同步：只添加本地没有的文件，不覆盖已有知识
+    const remoteFiles = fs.readdirSync(remotePlatformDir).filter(f => f.endsWith('.md'));
+    const localFiles = new Set(fs.readdirSync(localCommonDir).filter(f => f.endsWith('.md')));
+
+    let syncedCount = 0;
+    let skippedCount = 0;
+    for (const file of remoteFiles) {
+      const dest = path.join(localCommonDir, file);
+      if (localFiles.has(file)) {
+        skippedCount++;
+        continue;
+      }
+      const src = path.join(remotePlatformDir, file);
+      fs.copyFileSync(src, dest);
+      syncedCount++;
+    }
+
+    // 清理临时目录
+    exec(`rm -rf "${tmpDir}"`);
+
+    console.log(`✅ 知识同步完成：新增 ${syncedCount} 个，跳过 ${skippedCount} 个已有文件`);
+
+    // 白名单仓库：同步远端 project knowledge
+    const repoName = getRepoName(repoPath);
+    if (repoName && PROJECT_REMOTE_REPOS.includes(repoName)) {
+      syncProject(repoPath, { remote: getProjectRemoteUrl() });
+    }
+
+    return { synced: syncedCount, skipped: skippedCount };
+  } catch (e) {
+    // 清理临时目录
+    if (fs.existsSync(tmpDir)) {
+      exec(`rm -rf "${tmpDir}"`, { ignoreError: true });
+    }
+    console.error('错误：同步失败', e.message);
+    process.exit(1);
+  }
+}
+
+// sync project 命令：从远端 project knowledge 仓库同步（白名单仓库专用）
+function syncProject(repoPath, options = {}) {
+  const remoteUrl = options.remote;
+  const localProjectDir = path.join(repoPath, 'knowledge', 'project');
+  const tmpDir = path.join(repoPath, '.acs-tmp', 'remote-project-knowledge');
+  const repoName = getRepoName(repoPath);
+
+  if (!repoName) {
+    console.log('⚠️  无法从 git remote 推断仓库名，跳过 project 知识同步');
+    return { synced: 0 };
+  }
+
+  try {
+    if (fs.existsSync(tmpDir)) exec(`rm -rf "${tmpDir}"`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    console.log('📥 正在从远程仓库同步 Project 知识...');
+    console.log(`远程：${remoteUrl}`);
+    console.log(`仓库目录：${repoName}`);
+    exec(`git clone --depth 1 "${remoteUrl}" "${tmpDir}"`);
+
+    const remoteRepoDir = path.join(tmpDir, repoName);
+    if (!fs.existsSync(remoteRepoDir)) {
+      console.log(`⚠️  远程仓库中没有 ${repoName} 目录的 project 知识文档`);
+      exec(`rm -rf "${tmpDir}"`);
+      return { synced: 0 };
+    }
+
+    if (!fs.existsSync(localProjectDir)) {
+      fs.mkdirSync(localProjectDir, { recursive: true });
+    }
+
+    const remoteFiles = fs.readdirSync(remoteRepoDir).filter(f => f.endsWith('.md'));
+    const localFiles = new Set(fs.readdirSync(localProjectDir).filter(f => f.endsWith('.md')));
+
+    let syncedCount = 0;
+    let skippedCount = 0;
+    for (const file of remoteFiles) {
+      if (localFiles.has(file)) {
+        skippedCount++;
+        continue;
+      }
+      fs.copyFileSync(path.join(remoteRepoDir, file), path.join(localProjectDir, file));
+      syncedCount++;
+    }
+
+    exec(`rm -rf "${tmpDir}"`);
+    console.log(`✅ Project 知识同步完成：新增 ${syncedCount} 个，跳过 ${skippedCount} 个已有文件`);
+    return { synced: syncedCount, skipped: skippedCount };
+  } catch (e) {
+    console.error('Project 知识同步失败：', e.message);
+    return { synced: 0, error: e.message };
+  }
+}
+
+function upload(repoPath, options = {}) {
+  const remoteUrl = getRemoteUrl(options.remote);
+  const platform = options.platform === 'auto' ? detectPlatform(repoPath) : (options.platform || 'unknown');
+  const localCommonDir = path.join(repoPath, 'knowledge', 'common', normalizePlatform(platform));
+
+  if (!fs.existsSync(localCommonDir)) {
+    console.error(`错误：本地知识目录不存在：${localCommonDir}`);
+    process.exit(1);
+  }
+
+  const localFiles = fs.readdirSync(localCommonDir).filter(f => f.endsWith('.md'));
+  if (localFiles.length === 0) {
+    console.log('本地没有可上传的知识文档');
+    return { uploaded: 0 };
+  }
+
+  // 创建临时目录处理远程仓库
+  const tmpDir = path.join(repoPath, '.acs-tmp', 'remote-knowledge');
+  const workDir = process.cwd();
+
+  try {
+    // 清理并创建临时目录
+    if (fs.existsSync(tmpDir)) {
+      exec(`rm -rf "${tmpDir}"`);
+    }
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    // 克隆远程仓库
+    console.log('📤 正在准备远程仓库...');
+    exec(`git clone "${remoteUrl}" "${tmpDir}"`);
+
+    // 检查远程知识目录（支持两种结构：knowledge/common/<platform> 或 common/<platform>）
+    let remotePlatformDir = path.join(tmpDir, 'knowledge', 'common', normalizePlatform(platform));
+    if (!fs.existsSync(remotePlatformDir)) {
+      // 尝试简化结构：common/<platform>
+      const simplifiedDir = path.join(tmpDir, 'common', normalizePlatform(platform));
+      if (fs.existsSync(simplifiedDir) || fs.existsSync(path.join(tmpDir, 'common'))) {
+        remotePlatformDir = simplifiedDir;
+      }
+    }
+
+    // 确保远程目录结构存在
+    if (!fs.existsSync(remotePlatformDir)) {
+      fs.mkdirSync(remotePlatformDir, { recursive: true });
+    }
+
+    // 检查冲突（同名文件）
+    const remoteFiles = fs.readdirSync(remotePlatformDir).filter(f => f.endsWith('.md'));
+    const conflicts = localFiles.filter(f => remoteFiles.includes(f));
+    const newFiles = localFiles.filter(f => !remoteFiles.includes(f));
+
+    if (options.force) {
+      // --force: 上传所有文件（覆盖同名）
+      let uploadedCount = 0;
+      for (const file of localFiles) {
+        const src = path.join(localCommonDir, file);
+        const dest = path.join(remotePlatformDir, file);
+        fs.copyFileSync(src, dest);
+        uploadedCount++;
+      }
+
+      // 提交并推送
+      process.chdir(tmpDir);
+      exec('git add .');
+      try {
+        exec(`git commit -m "upload: ${platform} 知识文档更新 (${uploadedCount} files)"`);
+        exec('git push');
+      } catch (e) {
+        // nothing to commit
+      }
+
+      process.chdir(workDir);
+      exec(`rm -rf "${tmpDir}"`);
+
+      console.log(`✅ 知识上传完成：${uploadedCount} 个文件上传到远程仓库（覆盖模式）`);
+      return { uploaded: uploadedCount };
+    }
+
+    // 默认：只上传新增文件，跳过已存在的
+    if (newFiles.length === 0) {
+      console.log('⚠️  没有新增文件需要上传（远程已存在所有本地文件）');
+      if (conflicts.length > 0) {
+        console.log(`已跳过 ${conflicts.length} 个同名文件：${conflicts.join(', ')}`);
+        console.log('如需覆盖远程文件，请使用 --force 参数');
+      }
+      exec(`rm -rf "${tmpDir}"`);
+      return { uploaded: 0 };
+    }
+
+    // 复制新增文件到临时仓库
+    let uploadedCount = 0;
+    for (const file of newFiles) {
+      const src = path.join(localCommonDir, file);
+      const dest = path.join(remotePlatformDir, file);
+      fs.copyFileSync(src, dest);
+      uploadedCount++;
+    }
+
+    if (conflicts.length > 0) {
+      console.log(`跳过 ${conflicts.length} 个已存在文件：${conflicts.join(', ')}`);
+    }
+
+    // 提交并推送
+    process.chdir(tmpDir);
+    exec('git add .');
+    exec(`git commit -m "upload: ${platform} 知识文档更新 (${uploadedCount} files)"`);
+    exec('git push');
+
+    process.chdir(workDir);
+    exec(`rm -rf "${tmpDir}"`);
+
+    console.log(`✅ 知识上传完成：${uploadedCount} 个文件上传到远程仓库`);
+    return { uploaded: uploadedCount };
+  } catch (e) {
+    process.chdir(workDir);
+    if (fs.existsSync(tmpDir)) {
+      exec(`rm -rf "${tmpDir}"`, { ignoreError: true });
+    }
+    console.error('错误：上传失败', e.message);
+    process.exit(1);
+  }
+}
+
+
+
+// upload project 命令：上传本地 project 知识到远端 project knowledge 仓库
+function uploadProject(repoPath, options = {}) {
+  const remoteUrl = getProjectRemoteUrl();
+  const localProjectDir = path.join(repoPath, 'knowledge', 'project');
+  const repoName = getRepoName(repoPath);
+  if (!repoName) {
+    console.error('错误：无法从 git remote 推断仓库名');
+    process.exit(1);
+  }
+
+  if (!fs.existsSync(localProjectDir)) {
+    console.error(`错误：本地 project 知识目录不存在：${localProjectDir}`);
+    process.exit(1);
+  }
+
+  const localFiles = fs.readdirSync(localProjectDir).filter(f => f.endsWith('.md'));
+  if (localFiles.length === 0) {
+    console.log('本地没有可上传的 Project 知识文档');
+    return { uploaded: 0 };
+  }
+
+  const tmpDir = path.join(repoPath, '.acs-tmp', 'remote-project-knowledge');
+  const workDir = process.cwd();
+
+  try {
+    if (fs.existsSync(tmpDir)) exec(`rm -rf "${tmpDir}"`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    console.log('📤 正在准备远程 project 知识仓库...');
+    exec(`git clone "${remoteUrl}" "${tmpDir}"`);
+
+    const remoteRepoDir = path.join(tmpDir, repoName);
+    if (!fs.existsSync(remoteRepoDir)) {
+      fs.mkdirSync(remoteRepoDir, { recursive: true });
+    }
+
+    const remoteFiles = fs.readdirSync(remoteRepoDir).filter(f => f.endsWith('.md'));
+
+    if (options.force) {
+      let uploadedCount = 0;
+      for (const file of localFiles) {
+        fs.copyFileSync(path.join(localProjectDir, file), path.join(remoteRepoDir, file));
+        uploadedCount++;
+      }
+
+      process.chdir(tmpDir);
+      exec('git add .');
+      try {
+        exec(`git commit -m "upload: ${repoName} project 知识文档更新 (${uploadedCount} files)"`);
+        exec('git push');
+      } catch (e) { /* nothing to commit */ }
+
+      process.chdir(workDir);
+      exec(`rm -rf "${tmpDir}"`);
+      console.log(`✅ Project 知识上传完成：${uploadedCount} 个文件（覆盖模式）`);
+      return { uploaded: uploadedCount };
+    }
+
+    const newFiles = localFiles.filter(f => !remoteFiles.includes(f));
+    const conflicts = localFiles.filter(f => remoteFiles.includes(f));
+
+    if (newFiles.length === 0) {
+      console.log('⚠️  没有新增文件需要上传（远程已存在所有本地文件）');
+      if (conflicts.length > 0) {
+        console.log(`已跳过 ${conflicts.length} 个同名文件：${conflicts.join(', ')}`);
+        console.log('如需覆盖远程文件，请使用 --force 参数');
+      }
+      exec(`rm -rf "${tmpDir}"`);
+      return { uploaded: 0 };
+    }
+
+    let uploadedCount = 0;
+    for (const file of newFiles) {
+      fs.copyFileSync(path.join(localProjectDir, file), path.join(remoteRepoDir, file));
+      uploadedCount++;
+    }
+
+    if (conflicts.length > 0) {
+      console.log(`跳过 ${conflicts.length} 个已存在文件：${conflicts.join(', ')}`);
+    }
+
+    process.chdir(tmpDir);
+    exec('git add .');
+    exec(`git commit -m "upload: ${repoName} project 知识文档更新 (${uploadedCount} files)"`);
+    exec('git push');
+
+    process.chdir(workDir);
+    exec(`rm -rf "${tmpDir}"`);
+    console.log(`✅ Project 知识上传完成：${uploadedCount} 个文件上传到远程仓库`);
+    return { uploaded: uploadedCount };
+  } catch (e) {
+    process.chdir(workDir);
+    if (fs.existsSync(tmpDir)) {
+      exec(`rm -rf "${tmpDir}"`, { ignoreError: true });
+    }
+    console.error('错误：Project 知识上传失败', e.message);
+    process.exit(1);
+  }
+}
+
+
+
+// meet Freshness Check 命令：轻量知识保鲜检查
+function freshnessCheck(repoPath) {
+  const indexFile = path.join(repoPath, 'knowledge', 'knowledge-index.json');
+  if (!fs.existsSync(indexFile)) return;
+
+  let changedFiles;
+  try {
+    changedFiles = execSync('git diff HEAD~1 --name-only', { cwd: repoPath, encoding: 'utf8' }).trim();
+  } catch (e) {
+    return;
+  }
+
+  if (!changedFiles) return;
+
+  const changedLower = changedFiles.toLowerCase();
+  const index = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+  const allKnowledge = [...(index.repoKnowledge || []), ...(index.commonKnowledge || [])];
+  const affected = [];
+
+  for (const feature of allKnowledge) {
+    if (!feature.keywords || feature.keywords.length === 0) continue;
+    const matched = feature.keywords.filter(kw => changedLower.includes(kw.toLowerCase()));
+    if (matched.length > 0) {
+      const dir = feature.source === 'repo' ? 'knowledge/project' : `knowledge/common/${index.platform || 'unknown'}`;
+      affected.push({ path: `${dir}/${feature.path}`, title: feature.title || feature.id, keywords: matched, source: feature.source });
+    }
+  }
+
+  if (affected.length === 0) {
+    console.log('知识保鲜检查：无影响');
+    return;
+  }
+
+  console.log('');
+  console.log('⚠️  知识保鲜检查：以下知识文件可能受本次提交影响：');
+  console.log('');
+  for (const a of affected) {
+    console.log(`- ${a.path} (keywords: ${a.keywords.join(', ')})`);
+  }
+  console.log('');
+  console.log('建议读取这些知识文档，对照本次 commit 的代码变更（git diff HEAD~1）');
+  console.log('按照知识保鲜协议逐节校验并修补过时内容。');
+  console.log('');
+  console.log('协议参考：knowledge-freshness-protocol (acs-sdd-coding/references/)');
+}
+// ========== Setup 命令：完整知识准备流程 ==========
+function setup(repoPath, options = {}) {
+  const startTime = Date.now();
+  const platform = options.platform === 'auto' ? detectPlatform(repoPath) : (options.platform || 'unknown');
+
+  // 结果收集
+  const result = {
+    status: 'success',
+    repoPath,
+    platform,
+    steps: {},
+    warnings: [],
+    outputFiles: {},
+  };
+
+  console.log('');
+  console.log('────────────────────────────────────────');
+  console.log('🚀 ACS Knowledge Setup');
+  console.log('────────────────────────────────────────');
+  console.log(`仓库路径：${repoPath}`);
+  console.log(`平台类型：${platform}`);
+  console.log('');
+
+  // ========== Step 1：同步远程知识 ==========
+  console.log('📦 Step 1/4: 同步远程知识');
+  console.log('────────────────────────────────────────');
+
+  if (options.skipSync) {
+    console.log('⏭️  已跳过（--skip-sync）');
+    result.steps.sync = { status: 'skipped', reason: '--skip-sync' };
+  } else {
+    try {
+      const syncResult = sync(repoPath, { remote: options.remote, platform });
+      result.steps.sync = { status: 'success', synced: syncResult.synced };
+    } catch (e) {
+      if (options.failOnSyncError) {
+        console.error('同步失败，流程终止');
+        result.status = 'failed';
+        result.steps.sync = { status: 'failed', error: e.message };
+        return result;
+      }
+      console.log('同步失败，继续执行（使用本地知识）');
+      result.steps.sync = { status: 'failed_continued', error: e.message };
+      result.warnings.push('远程知识同步失败，使用本地知识');
+    }
+  }
+  console.log('');
+
+  // ========== Step 2：配置 .gitignore ==========
+  console.log('📦 Step 2/4: 配置 .gitignore');
+  console.log('────────────────────────────────────────');
+
+  const gitignorePath = path.join(repoPath, '.gitignore');
+  const gitignoreEntries = ['knowledge/common/', 'knowledge/knowledge-index.json', 'openspec/'];
+
+  // 白名单仓库：project knowledge 也需 gitignore
+  const setupRepoName = getRepoName(repoPath);
+  if (setupRepoName && PROJECT_REMOTE_REPOS.includes(setupRepoName)) {
+    gitignoreEntries.push('knowledge/project/');
+  }
+
+  try {
+    let content = fs.existsSync(gitignorePath) ? fs.readFileSync(gitignorePath, 'utf-8') : '';
+    const missing = gitignoreEntries.filter(entry => !content.includes(entry));
+
+    if (missing.length === 0) {
+      console.log(`.gitignore 已配置：${gitignoreEntries.join(', ')}`);
+      result.steps.gitignore = { status: 'success', action: 'already_configured' };
+    } else {
+      const block = `\n# ACS Coding - 运行时产物（勿提交）\n${missing.join('\n')}\n`;
+      if (!fs.existsSync(gitignorePath)) {
+        fs.writeFileSync(gitignorePath, block.trimStart());
+        console.log('✅ 创建 .gitignore 并添加 ' + missing.join(', '));
+        result.steps.gitignore = { status: 'success', action: 'created' };
+      } else {
+        fs.appendFileSync(gitignorePath, block);
+        console.log('✅ 已追加 ' + missing.join(', ') + ' 到 .gitignore');
+        result.steps.gitignore = { status: 'success', action: 'appended' };
+      }
+    }
+  } catch (e) {
+    console.log(`⚠️  .gitignore 配置失败：${e.message}`);
+    result.steps.gitignore = { status: 'failed', error: e.message };
+    result.warnings.push('.gitignore 配置失败');
+  }
+  console.log('');
+
+  // ========== Step 3：生成知识索引 ==========
+  console.log('📦 Step 3/4: 生成知识索引');
+  console.log('────────────────────────────────────────');
+
+  const outputPath = options.output || path.join(repoPath, 'knowledge', 'knowledge-index.json');
+
+  try {
+    const scanResult = scan(repoPath, { output: outputPath, platform });
+    result.steps.scan = {
+      status: 'success',
+      repoKnowledge: scanResult.repoKnowledge.length,
+      commonKnowledge: scanResult.commonKnowledge.length,
+      total: scanResult.repoKnowledge.length + scanResult.commonKnowledge.length,
+    };
+    result.outputFiles.knowledgeIndex = outputPath;
+
+    if (scanResult.warning) {
+      result.warnings.push(scanResult.warning);
+    }
+  } catch (e) {
+    console.error(`索引生成失败：${e.message}`);
+    result.steps.scan = { status: 'failed', error: e.message };
+    result.status = 'failed';
+    return result;
+  }
+  console.log('');
+
+  // ========== Step 4：部署 Schema（可选） ==========
+  console.log('📦 Step 4/4: 部署 OpenSpec Schema');
+  console.log('────────────────────────────────────────');
+
+  if (options.skipSchema) {
+    console.log('⏭️  已跳过（--skip-schema）');
+    result.steps.schema = { status: 'skipped', reason: '--skip-schema' };
+  } else {
+    try {
+      // Schema 源目录（从 CLI 所在仓库的 skill 目录中查找）
+      const cliPath = fs.realpathSync(process.argv[1]);
+      const repoRoot = path.dirname(path.dirname(cliPath));
+      const schemaCandidates = [
+        path.join(repoRoot, 'acs-sdd-coding', '.goose', 'schemas', 'acs-spec'),
+        path.join(repoRoot, 'acs-e2e-sdd-coding', '.goose', 'schemas', 'acs-spec'),
+      ];
+      const schemaSourceDir = schemaCandidates.find(p => fs.existsSync(p)) || schemaCandidates[0];
+      const schemaTargetDir = path.join(repoPath, '.goose', 'schemas', 'acs-spec');
+
+      if (!fs.existsSync(schemaSourceDir)) {
+        console.log(`⚠️  Schema 源目录不存在：${schemaSourceDir}`);
+        result.steps.schema = { status: 'skipped', reason: 'source-not-found' };
+      } else if (fs.existsSync(schemaTargetDir) && !options.forceSchema) {
+        console.log('✅ Schema 已部署（使用 --force-schema 强制覆盖）');
+        result.steps.schema = { status: 'success', action: 'already_exists' };
+      } else {
+        // 创建目标目录并复制
+        fs.mkdirSync(path.dirname(schemaTargetDir), { recursive: true });
+
+        // 递归复制目录
+        function copyDir(src, dest) {
+          fs.mkdirSync(dest, { recursive: true });
+          const entries = fs.readdirSync(src, { withFileTypes: true });
+          for (const entry of entries) {
+            const srcPath = path.join(src, entry.name);
+            const destPath = path.join(dest, entry.name);
+            if (entry.isDirectory()) {
+              copyDir(srcPath, destPath);
+            } else {
+              fs.copyFileSync(srcPath, destPath);
+            }
+          }
+        }
+
+        copyDir(schemaSourceDir, schemaTargetDir);
+        console.log('✅ Schema 部署完成');
+        result.steps.schema = { status: 'success', action: 'deployed', path: schemaTargetDir };
+      }
+    } catch (e) {
+      console.log(`⚠️  Schema 部署失败：${e.message}`);
+      result.steps.schema = { status: 'failed', error: e.message };
+      result.warnings.push('Schema 部署失败');
+    }
+  }
+  console.log('');
+
+
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+
+  console.log('────────────────────────────────────────');
+  console.log('📊 Setup 完成汇总');
+  console.log('────────────────────────────────────────');
+  console.log(`执行耗时：${duration}s`);
+  console.log('');
+
+
+  // 各步骤状态
+  const stepStatus = (step) => {
+    if (step.status === 'success') return '✅';
+    if (step.status === 'skipped') return '⏭️';
+    if (step.status === 'failed') return '❌';
+    if (step.status === 'failed_continued') return '⚠️';
+    return '？';
+  };
+
+  console.log('步骤详情：');
+  console.log(`  ${stepStatus(result.steps.sync)} 同步远程知识：${result.steps.sync.status}`);
+  console.log(`  ${stepStatus(result.steps.gitignore)} 配置 .gitignore：${result.steps.gitignore.status}`);
+  console.log(`  ${stepStatus(result.steps.scan)} 生成知识索引：${result.steps.scan.status}`);
+  console.log(`  ${stepStatus(result.steps.schema)} 部署 Schema：${result.steps.schema.status}`);
+  console.log('');
+
+  // 知识统计
+  if (result.steps.scan.status === 'success') {
+    console.log('知识统计：');
+    console.log(`  仓库知识：${result.steps.scan.repoKnowledge} 条`);
+    console.log(`  通用知识：${result.steps.scan.commonKnowledge} 条`);
+    console.log(`  索引文件：${result.outputFiles.knowledgeIndex}`);
+    console.log('');
+  }
+
+  // 警告
+  if (result.warnings.length > 0) {
+    console.log('警告：');
+    result.warnings.forEach(w => console.log(`  - ${w}`));
+    console.log('');
+  }
+
+  result.duration = parseFloat(duration);
+
+  // 输出 JSON（如果指定了 --json）
+  if (options.json) {
+    console.log(JSON.stringify(result, null, 2));
+  }
+
+  return result;
+}
+
+
+
+function main() {
+  const args = process.argv.slice(2);
+  const command = args[0];
+
+  // 解析通用选项
+  const getOption = (name) => {
+    const idx = args.indexOf(name);
+    return idx > -1 ? args[idx + 1] : null;
+  };
+
+  const hasFlag = (name) => args.includes(name);
+
+  if (command === 'scan') {
+    const repoPath = path.resolve(args[1] || '.');
+    const output = getOption('--output');
+    const platform = getOption('--platform') || 'auto';
+
+    if (!fs.existsSync(repoPath)) {
+      console.error('错误：路径不存在', repoPath);
+      process.exit(1);
+    }
+
+    console.log(`仓库路径：${repoPath}`);
+    scan(repoPath, { output, platform });
+    return;
+  }
+
+  if (command === 'sync') {
+    const repoPath = path.resolve(args[1] || '.');
+    const remote = getOption('--remote');
+    const platform = getOption('--platform') || 'auto';
+
+    if (!fs.existsSync(repoPath)) {
+      console.error('错误：路径不存在', repoPath);
+      process.exit(1);
+    }
+
+    console.log(`仓库路径：${repoPath}`);
+    sync(repoPath, { remote, platform });
+    return;
+  }
+
+  if (command === 'upload') {
+    const repoPath = path.resolve(args[1] || '.');
+    const remote = getOption('--remote');
+    const platform = getOption('--platform') || 'auto';
+    const force = hasFlag('--force');
+
+    if (!fs.existsSync(repoPath)) {
+      console.error('错误：路径不存在', repoPath);
+      process.exit(1);
+    }
+
+    console.log(`仓库路径：${repoPath}`);
+    upload(repoPath, { remote, platform, force });
+    return;
+  }
+
+  if (command === 'upload-project') {
+    const repoPath = path.resolve(args[1] || '.');
+    const force = hasFlag('--force');
+
+    if (!fs.existsSync(repoPath)) {
+      console.error('错误：路径不存在', repoPath);
+      process.exit(1);
+    }
+
+    console.log(`仓库路径：${repoPath}`);
+    uploadProject(repoPath, { force });
+    return;
+  }
+
+  if (command === 'freshness-check') {
+    const repoPath = path.resolve(args[1] || '.');
+    freshnessCheck(repoPath);
+    return;
+  }
+
+  if (command === 'setup') {
+    const repoPath = path.resolve(args[1] || '.');
+    const remote = getOption('--remote');
+    const platform = getOption('--platform') || 'auto';
+    const output = getOption('--output');
+
+    if (!fs.existsSync(repoPath)) {
+      console.error('错误：路径不存在', repoPath);
+      process.exit(1);
+    }
+
+    const result = setup(repoPath, {
+      remote,
+      platform,
+      output,
+      skipSync: hasFlag('--skip-sync'),
+      skipSchema: hasFlag('--skip-schema'),
+      forceSchema: hasFlag('--force-schema'),
+      failOnSyncError: hasFlag('--fail-on-sync-error'),
+      json: hasFlag('--json'),
+    });
+
+    process.exit(result.status === 'success' ? 0 : 1);
+  }
+
+  console.log(`
+Usage: acs-knowledge-index <command> [options]
+
+Commands:
+  scan [repo-path]              扫描知识目录生成索引（默认当前目录）
+  sync [repo-path]              从远程仓库同步知识到本地（默认当前目录）
+  upload [repo-path]            上传本地 common 知识到远程仓库（默认当前目录）
+  upload-project [repo-path]    上传本地 project 知识到远端 project 知识仓库
+  setup [repo-path]             完整知识准备流程（sync + gitignore + scan + schema）
+  freshness-check [repo-path]   检查最近 commit 是否影响知识文档（PostToolUse hook 用）
+
+Options:
+  --platform <name>             指定平台（iOS/Android），默认 auto 检测
+  --output <path>               输出 JSON 文件路径（scan/setup 命令）
+  --remote <URL>                远程仓库地址（默认使用内置地址）
+  --force                       强制覆盖远程文件（upload 命令）
+
+Setup 专用选项:
+  --skip-sync                   跳过远程知识同步
+  --skip-schema                 跳过 Schema 部署
+  --force-schema                强制覆盖已存在的 Schema
+  --fail-on-sync-error          同步失败时终止流程（默认继续）
+  --json                        输出 JSON 格式结果
+
+Examples:
+  acs-knowledge-index sync                         # 同步知识到当前仓库
+  acs-knowledge-index sync ~/projects/my-app       # 同步知识到指定仓库
+  acs-knowledge-index scan                         # 扫描当前仓库知识索引
+  acs-knowledge-index upload --platform iOS        # 上传 iOS common 知识到远程
+  acs-knowledge-index upload-project               # 上传 project 知识到远端仓库
+  acs-knowledge-index setup                        # 执行完整知识准备流程
+  acs-knowledge-index setup --skip-sync            # 跳过同步，执行其他步骤
+
+Configuration:
+  远程仓库地址优先级：--remote 参数 > ACS_COMMON_KNOWLEDGE_URL 环境变量 > 默认值
+  Project 知识远端模式：白名单仓库自动从远端同步 Project 知识（见 PROJECT_REMOTE_REPOS）
+`);
+}
+
+main();

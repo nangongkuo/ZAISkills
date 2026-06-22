@@ -1,0 +1,428 @@
+#!/bin/bash
+
+# 公共知识准备脚本（供 acs-cc / acs-cfuse 调用）
+# 功能：前置校验 → 知识同步/扫描 → gitignore 配置 → CLAUDE.md 生成
+
+set -e
+
+# 颜色
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# ========================================
+# 前置校验
+# ========================================
+
+# 检查是否在 git 仓库中
+if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+    echo -e "${RED}错误：当前目录不是 git 仓库${NC}"
+    echo "请在业务仓库目录下执行此命令"
+    exit 1
+fi
+
+# 获取仓库根目录
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# 检查 acs-knowledge-index 是否已安装
+if ! which acs-knowledge-index &>/dev/null; then
+    echo -e "${RED}错误：acs-knowledge-index CLI 未安装${NC}"
+    echo "请先执行 acs-install.sh 安装"
+    exit 1
+fi
+
+
+
+# 自动更新检查（兼容旧版 acs-cfuse/acs-cc）
+# 新版入口脚本已在 source 前完成更新，通过 _ACS_UPDATE_DONE 跳过此段
+# ========================================
+if [ -z "$_ACS_UPDATE_DONE" ]; then
+    ACS_REPO="$HOME/.codefuse/ClientSkills"
+    ACS_COMMIT_FILE="$ACS_REPO/.acs-installed-commit"
+
+    if [ -d "$ACS_REPO/.git" ]; then
+        INSTALLED_COMMIT=$(cat "$ACS_COMMIT_FILE" 2>/dev/null)
+
+        # 先 fetch 获取远程最新 commit，再对比
+        REMOTE_COMMIT=""
+        if git -C "$ACS_REPO" fetch origin --quiet 2>/dev/null; then
+            REMOTE_COMMIT=$(git -C "$ACS_REPO" rev-parse origin/master 2>/dev/null)
+        fi
+
+        if [ -n "$REMOTE_COMMIT" ] && [ "$REMOTE_COMMIT" != "$INSTALLED_COMMIT" ]; then
+            echo -e "${YELLOW}检测到 ACS 工具有更新（远程：${REMOTE_COMMIT:0:7}），正在自动执行 acs-install...${NC}"
+            if bash "$ACS_REPO/acs-install.sh"; then
+                echo -e "${GREEN}✅ ACS 工具更新完成${NC}"
+            else
+                echo -e "${YELLOW}⚠ ACS 工具更新失败，继续使用当前版本${NC}"
+            fi
+            echo ""
+        fi
+    fi
+fi
+
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BLUE}  ACS 知识准备${NC}"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+
+# ========================================
+# 知识同步
+# ========================================
+
+# 自动检测平台
+PLATFORM="auto"
+if [ -f "$REPO_ROOT/build.gradle" ]; then
+    PLATFORM="Android"
+elif ls "$REPO_ROOT"/*.xcodeproj &>/dev/null 2>&1; then
+    PLATFORM="iOS"
+fi
+
+# 确保知识目录存在
+if [ ! -d "$REPO_ROOT/knowledge/project" ]; then
+    mkdir -p "$REPO_ROOT/knowledge/project"
+fi
+if [ ! -d "$REPO_ROOT/knowledge/common" ]; then
+    mkdir -p "$REPO_ROOT/knowledge/common"
+fi
+
+echo -e "${BLUE}[1/5] 同步远程知识${NC}"
+if acs-knowledge-index sync "$REPO_ROOT" --platform "$PLATFORM" 2>/dev/null; then
+    echo -e "  ${GREEN}●${NC} 同步完成"
+else
+    echo -e "  ${YELLOW}●${NC} 同步失败，使用本地知识继续"
+fi
+echo ""
+
+# ========================================
+# 生成知识索引
+# ========================================
+
+INDEX_FILE="$REPO_ROOT/knowledge/knowledge-index.json"
+
+echo -e "${BLUE}[2/5] 生成知识索引${NC}"
+if acs-knowledge-index scan "$REPO_ROOT" --platform "$PLATFORM" --output "$INDEX_FILE" 2>/dev/null; then
+    echo -e "  ${GREEN}●${NC} 索引已生成：knowledge/knowledge-index.json"
+else
+    echo -e "  ${YELLOW}●${NC} 索引生成失败，跳过"
+fi
+echo ""
+
+# ========================================
+# 配置 .gitignore
+# ========================================
+
+echo -e "${BLUE}[3/5] 配置 .gitignore${NC}"
+
+GITIGNORE="$REPO_ROOT/.gitignore"
+ENTRIES=("knowledge/knowledge-index.json" "knowledge/common/" ".acs-sdd-coding/")
+
+# 白名单仓库：project 知识由远端维护，需要 gitignore
+REPO_NAME=$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null | sed 's/.*\///' | sed 's/\.git$//')
+PROJECT_REMOTE_REPOS=("ios-phone-homecard" "android-phone-homefeeds-git")
+for _repo in "${PROJECT_REMOTE_REPOS[@]}"; do
+    if [ "$REPO_NAME" = "$_repo" ]; then
+        ENTRIES+=("knowledge/project/")
+        break
+    fi
+done
+
+ADDED=0
+
+for entry in "${ENTRIES[@]}"; do
+    if [ -f "$GITIGNORE" ] && grep -qF "$entry" "$GITIGNORE"; then
+        continue
+    fi
+
+    if [ ! -f "$GITIGNORE" ]; then
+        echo "# ACS Coding - 运行时产物（勿提交）" > "$GITIGNORE"
+    fi
+
+    echo "$entry" >> "$GITIGNORE"
+    ADDED=$((ADDED + 1))
+done
+
+if [ $ADDED -gt 0 ]; then
+    echo -e "  ${GREEN}●${NC} 已添加 $ADDED 条 gitignore 规则"
+else
+    echo -e "  ${GREEN}●${NC} gitignore 已配置"
+fi
+echo ""
+
+# ========================================
+# 配置 Claude Code 权限
+# ========================================
+
+echo -e "${BLUE}[4/5] 配置 Claude Code 权限${NC}"
+
+SETTINGS_DIR="$REPO_ROOT/.claude"
+SETTINGS_FILE="$SETTINGS_DIR/settings.local.json"
+
+mkdir -p "$SETTINGS_DIR"
+
+PERM_RESULT=$(node -e "
+const fs = require('fs');
+const settingsFile = '$SETTINGS_FILE';
+let cfg;
+try { cfg = JSON.parse(fs.readFileSync(settingsFile, 'utf8')); } catch(e) { cfg = {}; }
+if (!cfg.permissions) cfg.permissions = {};
+if (!cfg.permissions.allow) cfg.permissions.allow = [];
+// defaultMode=acceptEdits: 让 session 启动即自动放行文件编辑（Edit/Write/NotebookEdit）。
+// 原因：James 等编码子 agent 以 run_in_background 派发，没有交互通道弹确认框，
+//       源码编辑落在 allow 之外时“需确认”会退化成直接 deny，导致 James 卡死。
+//       acceptEdits 只降级文件编辑这一类；Bash 危险命令仍走 allow/ask、deny 列表全保留。
+// 仅在用户未显式配置过 defaultMode 时写入，避免覆盖用户自定义模式。
+if (!cfg.permissions.defaultMode) cfg.permissions.defaultMode = 'acceptEdits';
+const needed = [
+  // 文件系统
+  'Bash(which:*)', 'Bash(test:*)', 'Bash(mkdir:*)',
+  'Bash(cat:*)', 'Bash(echo:*)', 'Bash(ls:*)', 'Bash(grep:*)',
+  'Bash(find:*)', 'Bash(rm -rf:*)',
+  // Git
+  'Bash(git checkout:*)', 'Bash(git add:*)', 'Bash(git commit:*)',
+  'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git push:*)',
+  'Bash(git branch:*)', 'Bash(git fetch:*)', 'Bash(git status:*)',
+  // Node.js / NPM
+  'Bash(node:*)', 'Bash(npm install:*)', 'Bash(npm list:*)',
+  'Bash(npx:*)',
+  // OpenSpec & 知识管理
+  'Bash(acs-knowledge-index:*)', 'Bash(openspec:*)',
+  // ACS CLI 工具集（避免 skill 执行过程中频繁鉴权）
+  'Bash(acs-junior:*)', 'Bash(acs-report:*)', 'Bash(acs-report-hook:*)',
+  'Bash(acs-trace:*)',
+  'Bash(acs-cc:*)', 'Bash(acs-cfuse:*)', 'Bash(acs-cx:*)',
+  // ANC 命令
+  'Bash(anc build:*)', 'Bash(anc spec:*)', 'Bash(anc ff:*)',
+  'Bash(anc sync:*)', 'Bash(anc apply:*)', 'Bash(anc agent:*)',
+  // iOS 构建 & 模拟器
+  'Bash(pod install:*)', 'Bash(bundle exec:*)',
+  'Bash(xcodebuild:*)', 'Bash(xcrun:*)', 'Bash(xcrun:*)',
+  // Android 构建 & 模拟器
+  'Bash(adb:*)', 'Bash(emulator:*)', 'Bash(aapt:*)',
+  // 构建辅助
+  'Bash(python:*)',
+  // PR 创建
+  'Bash(gh:*)',
+  // 语雀 CLI
+  'Bash(yuque:*)', 'Bash(yuque-ant-cli:*)',
+  'Bash(yuque doc:*)', 'Bash(yuque show:*)',
+  'Bash(yuque view:*)', 'Bash(yuque read:*)',
+  'Bash(yuque create:*)', 'Bash(yuque list:*)',
+  'Bash(yuque update:*)', 'Bash(yuque resolve:*)',
+  // 流水线工件目录：子 agent（Will/Dave/Alex 等）用 Write/Edit 工具落盘非代码工件。
+  // 业务源码（James 编码）不在此显式放行，改由上面的 defaultMode=acceptEdits 统一覆盖，
+  // 这样无需穷举各端源码路径（Sources/、app/src/、entry/src/ets 等）也能让 James 写源码。
+  'Write(./.acs-junior-engineer/**)', 'Edit(./.acs-junior-engineer/**)',
+  'Write(./.acs-sdd-coding/**)', 'Edit(./.acs-sdd-coding/**)',
+  'Write(./knowledge/**)', 'Edit(./knowledge/**)',
+  'Write(./openspec/**)', 'Edit(./openspec/**)'
+];
+const existing = new Set(cfg.permissions.allow);
+let added = 0;
+needed.forEach(r => { if (!existing.has(r)) { existing.add(r); added++; } });
+cfg.permissions.allow = [...existing];
+// idle_prompt 通知 Hook：等待用户输入超 60 秒时弹窗提醒
+if (!cfg.hooks) cfg.hooks = {};
+if (!cfg.hooks.Notification) cfg.hooks.Notification = [];
+const idleHook = {
+  matcher: 'idle_prompt',
+  hooks: [{
+    type: 'command',
+    command: 'osascript -e \"display alert \\\\\\\"ACS Coding\\\\\\\" message \\\\\\\"Claude 正在等待你的确认，请回来查看\\\\\\\"\"',
+    timeout: 60
+  }]
+};
+if (!cfg.hooks.Notification.some(h => h.matcher === 'idle_prompt')) {
+  cfg.hooks.Notification.push(idleHook);
+}
+// PostToolUse hook: commit 后自动知识保鲜检查
+if (!cfg.hooks.PostToolUse) cfg.hooks.PostToolUse = [];
+const freshnessHook = {
+  matcher: 'Bash(*git commit*)',
+  hooks: [{
+    type: 'command',
+    command: 'acs-knowledge-index freshness-check',
+    timeout: 15
+  }]
+};
+if (!cfg.hooks.PostToolUse.some(h => h.hooks && h.hooks.some(hh => hh.command && hh.command.includes('freshness-check')))) {
+  cfg.hooks.PostToolUse.push(freshnessHook);
+}
+// UserPromptSubmit hook：用户敲 /acs-xxx 斜杠命令时建 trace span
+// 原因：Claude Code 对 /<skill-name> 用 <command-name> 标签内联展开，
+//       不会发起 Skill tool call，PreToolUse(Skill) 无法命中
+if (!cfg.hooks.UserPromptSubmit) cfg.hooks.UserPromptSubmit = [];
+const reportPromptHook = {
+  hooks: [{
+    type: 'command',
+    command: 'acs-report-hook prompt',
+    timeout: 5
+  }]
+};
+const hasReportHook = (arr, cmd) => arr.some(h => h.hooks && h.hooks.some(hh => hh.command === cmd));
+if (!hasReportHook(cfg.hooks.UserPromptSubmit, 'acs-report-hook prompt')) {
+  cfg.hooks.UserPromptSubmit.push(reportPromptHook);
+}
+
+// 升级清理：移除老版本残留的 PreToolUse(Skill) → acs-report-hook start 注册
+// 原因：该 hook 仅覆盖 Claude 自动触发 skill 的场景，与 UserPromptSubmit 路径职责重叠且语义混乱。
+//       统一收敛到 UserPromptSubmit + Skill 内显式 acs-trace 调用
+if (Array.isArray(cfg.hooks.PreToolUse)) {
+  cfg.hooks.PreToolUse = cfg.hooks.PreToolUse.filter(h =>
+    !(h.hooks && h.hooks.some(hh => hh.command === 'acs-report-hook start'))
+  );
+  if (cfg.hooks.PreToolUse.length === 0) delete cfg.hooks.PreToolUse;
+}
+
+// 升级清理：移除老版本残留的 PostToolUse(Skill) → acs-report-hook end 注册
+if (Array.isArray(cfg.hooks.PostToolUse)) {
+  cfg.hooks.PostToolUse = cfg.hooks.PostToolUse.filter(h =>
+    !(h.hooks && h.hooks.some(hh => hh.command === 'acs-report-hook end'))
+  );
+}
+// SessionStart hook：启动时 drain 本地 trace 文件并上报后端
+if (!cfg.hooks.SessionStart) cfg.hooks.SessionStart = [];
+const traceDrainHook = {
+  matcher: 'startup',
+  hooks: [{
+    type: 'command',
+    command: 'acs-trace drain',
+    timeout: 8
+  }]
+};
+if (!cfg.hooks.SessionStart.some(h => h.hooks && h.hooks.some(hh => hh.command === 'acs-trace drain'))) {
+  cfg.hooks.SessionStart.push(traceDrainHook);
+}
+fs.writeFileSync(settingsFile, JSON.stringify(cfg, null, 2));
+console.log(added);
+" 2>/dev/null)
+
+# 同步配置 Codex hooks（acs-cx 启动时生效，结构与 Claude Code 镜像）
+CODEX_DIR="$REPO_ROOT/.codex"
+CODEX_HOOKS_FILE="$CODEX_DIR/hooks.json"
+mkdir -p "$CODEX_DIR"
+
+node -e "
+const fs = require('fs');
+const f = '$CODEX_HOOKS_FILE';
+let cfg;
+try { cfg = JSON.parse(fs.readFileSync(f, 'utf8')); } catch(e) { cfg = {}; }
+if (!cfg.hooks) cfg.hooks = {};
+
+// SessionStart → drain
+if (!cfg.hooks.SessionStart) cfg.hooks.SessionStart = [];
+const drainHook = {
+  matcher: 'startup|resume',
+  hooks: [{ type: 'command', command: 'acs-trace drain', timeout: 8 }]
+};
+if (!cfg.hooks.SessionStart.some(h => h.hooks && h.hooks.some(hh => hh.command === 'acs-trace drain'))) {
+  cfg.hooks.SessionStart.push(drainHook);
+}
+
+// PreToolUse(Skill) + start：已废弃，由 UserPromptSubmit 路径统一接管
+// 保留升级清理，移除存量配置
+if (Array.isArray(cfg.hooks.PreToolUse)) {
+  cfg.hooks.PreToolUse = cfg.hooks.PreToolUse.filter(h =>
+    !(h.hooks && h.hooks.some(hh => hh.command === 'acs-report-hook start'))
+  );
+  if (cfg.hooks.PreToolUse.length === 0) delete cfg.hooks.PreToolUse;
+}
+
+// UserPromptSubmit → prompt（与 Claude Code 镜像；Codex 该事件忽略 matcher）
+if (!cfg.hooks.UserPromptSubmit) cfg.hooks.UserPromptSubmit = [];
+const promptHook = {
+  hooks: [{ type: 'command', command: 'acs-report-hook prompt', timeout: 5 }]
+};
+if (!cfg.hooks.UserPromptSubmit.some(h => h.hooks && h.hooks.some(hh => hh.command === 'acs-report-hook prompt'))) {
+  cfg.hooks.UserPromptSubmit.push(promptHook);
+}
+
+// 升级清理：移除老版本残留的 PostToolUse(Skill) → acs-report-hook end 注册
+if (Array.isArray(cfg.hooks.PostToolUse)) {
+  cfg.hooks.PostToolUse = cfg.hooks.PostToolUse.filter(h =>
+    !(h.hooks && h.hooks.some(hh => hh.command === 'acs-report-hook end'))
+  );
+  if (cfg.hooks.PostToolUse.length === 0) delete cfg.hooks.PostToolUse;
+}
+
+fs.writeFileSync(f, JSON.stringify(cfg, null, 2));
+" 2>/dev/null
+
+if [ -n "$PERM_RESULT" ] && [ "$PERM_RESULT" = "0" ]; then
+    echo -e "  ${GREEN}●${NC} 权限与 Hooks 已配置（Claude Code + Codex）"
+elif [ -n "$PERM_RESULT" ]; then
+    echo -e "  ${GREEN}●${NC} 已添加 $PERM_RESULT 条权限规则，Hooks 已配置（Claude Code + Codex）"
+else
+    echo -e "  ${YELLOW}●${NC} 权限配置失败，跳过"
+fi
+echo ""
+
+
+# 安装 Python 依赖
+# ========================================
+
+if [ "$PLATFORM" = "iOS" ]; then
+    python3 -c "import pbxproj" 2>/dev/null || pip3 install pbxproj --quiet 2>/dev/null || true
+fi
+
+# ========================================
+# 生成/更新 CLAUDE.md
+# ========================================
+
+echo -e "${BLUE}[5/5] 配置 CLAUDE.md${NC}"
+CLAUDE_MD="$REPO_ROOT/CLAUDE.md"
+# 使用标记注释识别知识引导段落
+MARKER_START="<!-- acs-knowledge-start -->"
+MARKER_END="<!-- acs-knowledge-end -->"
+
+KNOWLEDGE_BLOCK="$MARKER_START
+# 项目知识
+
+本仓库配置了知识文档系统，包含项目特有的编码规范、API 使用指南和技术约束。
+
+## 知识索引
+
+知识索引文件：\`knowledge/knowledge-index.json\`
+
+当用户提问涉及代码、架构、API 使用等技术问题时，请先读取 \`knowledge/knowledge-index.json\` 获取知识文档列表，
+根据问题相关性读取对应的知识文档（位于 \`knowledge/\` 目录下），基于知识内容给出回答。
+
+## 知识目录结构
+
+- \`knowledge/project/\` - 仓库特有知识（编码规范、模块设计等）
+- \`knowledge/common/<平台>/\` - 通用平台知识（iOS/Android 通用能力封装）
+$MARKER_END"
+
+HUOBANSPEC_MARKER="<!-- HUOBANSPEC:START -->"
+
+if [ ! -f "$CLAUDE_MD" ]; then
+    # 不存在，直接创建
+    echo "$KNOWLEDGE_BLOCK" > "$CLAUDE_MD"
+    echo -e "  ${GREEN}●${NC} CLAUDE.md 已创建"
+elif grep -qF "$HUOBANSPEC_MARKER" "$CLAUDE_MD"; then
+    # 包含 HUOBANSPEC 标记，备份原文件后创建新的
+    cp "$CLAUDE_MD" "$REPO_ROOT/CLAUDE_bak.md"
+    echo "$KNOWLEDGE_BLOCK" > "$CLAUDE_MD"
+    echo -e "  ${GREEN}●${NC} 原 CLAUDE.md 已备份为 CLAUDE_bak.md"
+    echo -e "  ${GREEN}●${NC} CLAUDE.md 已重新创建"
+elif grep -qF "$MARKER_START" "$CLAUDE_MD"; then
+    # 已有知识段落，提取标记外的内容并重新组装
+    {
+        sed -n "/$MARKER_START/q;p" "$CLAUDE_MD"
+        echo "$KNOWLEDGE_BLOCK"
+        sed -n "/$MARKER_END/,\$p" "$CLAUDE_MD" | tail -n +2
+    } > "$CLAUDE_MD.tmp"
+    mv "$CLAUDE_MD.tmp" "$CLAUDE_MD"
+    echo -e "  ${GREEN}●${NC} CLAUDE.md 知识段落已更新"
+else
+    # 存在但无知识段落也无 HUOBANSPEC，追加
+    echo "" >> "$CLAUDE_MD"
+    echo "$KNOWLEDGE_BLOCK" >> "$CLAUDE_MD"
+    echo -e "  ${GREEN}●${NC} CLAUDE.md 已追加知识引导"
+fi
+echo ""
+
+echo -e "${GREEN}✅ 知识准备完成${NC}"
+echo ""

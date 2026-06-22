@@ -1,0 +1,33 @@
+#!/bin/bash
+
+# zai-cc: 知识准备 + 启动 Claude Code
+
+# 解析符号链接，找到脚本真实所在目录
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
+
+# 先更新再 source，确保读到最新版本
+ZAI_REPO="$HOME/.codefuse/ZAISkills"
+ZAI_COMMIT_FILE="$ZAI_REPO/.zai-installed-commit"
+if [ -d "$ZAI_REPO/.git" ]; then
+    INSTALLED_COMMIT=$(cat "$ZAI_COMMIT_FILE" 2>/dev/null)
+    REMOTE_COMMIT=""
+    if git -C "$ZAI_REPO" fetch origin --quiet 2>/dev/null; then
+        REMOTE_COMMIT=$(git -C "$ZAI_REPO" rev-parse origin/master 2>/dev/null)
+    fi
+    if [ -n "$REMOTE_COMMIT" ] && [ "$REMOTE_COMMIT" != "$INSTALLED_COMMIT" ]; then
+        echo -e "\033[1;33m检测到 ZAI 工具有更新，正在自动执行 zai-install...\033[0m"
+        if bash "$ZAI_REPO/zai-install.sh"; then
+            echo -e "\033[0;32m✅ ZAI 工具更新完成\033[0m"
+        else
+            echo -e "\033[1;33m⚠ ZAI 工具更新失败，继续使用当前版本\033[0m"
+        fi
+        echo ""
+    fi
+fi
+export _ZAI_UPDATE_DONE=1
+
+# 执行知识准备
+source "$SCRIPT_DIR/_zai-prepare-knowledge"
+
+# 启动 Claude
+exec claude "$@"

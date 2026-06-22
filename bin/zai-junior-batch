@@ -1,0 +1,8 @@
+#!/bin/bash
+
+# zai-junior-batch: 批量驱动 zai-junior-engineer + 观测汇总
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
+CLI="$(dirname "$SCRIPT_DIR")/zai-junior-engineer/batch/cli.js"
+
+exec node "$CLI" "$@"

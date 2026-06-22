@@ -1,0 +1,16 @@
+# acs-junior-engineer/batch/fixtures/demo-cases.yaml
+run_name: smoke-dryrun
+defaults:
+  repo: /tmp/nonexistent-repo
+  base_branch: master
+  model: claude-opus-4-8
+  ability: feature
+cases:
+  - id: F001
+    title: 冒烟 feature
+    yuque_url: https://yuque.antfin.com/demo/abc
+  - id: B001
+    title: 冒烟 bugfix
+    ability: bugfix
+    defect_id: DIMA-1
+    defect_source: dima

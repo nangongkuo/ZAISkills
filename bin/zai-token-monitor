@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# acs-token-monitor: wrapper for acs-token-monitor/lib/token-monitor.sh
+# 解析符号链接，定位仓库根目录，转发所有参数给 lib 实现脚本
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
+LIB_SCRIPT="$SCRIPT_DIR/../acs-token-monitor/lib/token-monitor.sh"
+
+if [ ! -f "$LIB_SCRIPT" ]; then
+  echo "[acs-token-monitor] 错误：找不到 lib 脚本 $LIB_SCRIPT" >&2
+  exit 1
+fi
+
+exec bash "$LIB_SCRIPT" "$@"

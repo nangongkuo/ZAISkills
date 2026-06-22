@@ -1,0 +1,68 @@
+#!/bin/bash
+
+# zai-junior: junior-engineer 流水线 CLI 统一入口
+# 详细契约见 zai-junior-engineer/lib/CONTRACTS.md
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
+SKILL_BASE="$(dirname "$SCRIPT_DIR")/zai-junior-engineer"
+LIB="$SKILL_BASE/lib"
+
+case "$1" in
+    boot)           exec node "$LIB/boot.js" "${@:2}" ;;
+    tick)           exec node "$LIB/tick.js" "${@:2}" ;;
+    render)         exec node "$LIB/render.js" "${@:2}" ;;
+    advance)        exec node "$LIB/advance.js" "${@:2}" ;;
+    watchdog-check) exec node "$LIB/watchdog-check.js" "${@:2}" ;;
+    state)          exec node "$LIB/update-state.js" "${@:2}" ;;
+    validate)       exec node "$LIB/validate-state.js" "${@:2}" ;;
+    build-check)    exec node "$LIB/check-build-failure.js" "${@:2}" ;;
+    config-gen)     exec node "$LIB/generate-config.js" "${@:2}" ;;
+    defect)         exec node "$LIB/query-defects.js" "${@:2}" ;;
+    abilities)      exec node "$LIB/abilities.js" "${@:2}" ;;
+    submit)
+        case "$2" in
+            iteration) exec node "$LIB/submit-iteration.js" "${@:3}" ;;
+            "")
+                echo "zai-junior submit: missing action (iteration)" >&2
+                exit 1
+                ;;
+            *)
+                echo "zai-junior submit: unknown action '$2'" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    ""|-h|--help|help)
+        cat <<EOF
+zai-junior - junior-engineer 流水线 CLI 入口
+
+用法: zai-junior <subcommand> [args...]
+
+主循环:
+  boot <repo>                              启动入口: 分流 new_task / resume_menu, 输出决策 JSON
+  tick <repo>                              状态机驱动, 输出 action JSON
+  render <repo> --stage N [--raw]          渲染 agent prompt
+  advance <repo> --stage N [...]           阶段流转 (done/skipped)
+  watchdog-check <repo> --stage N          看门狗超时探测 (只读, 输出 expired/task_id/重设 cron)
+
+辅助:
+  state <repo> set|append|init|reset [...] 非状态机字段写入 / 阶段 0 初始化 / 删除 state.md
+  validate <repo> [--stage N]              state.md schema 校验
+  abilities list|load|resolve-* [...]      ability 路由层 (list / load / resolve-init / resolve-agent / resolve-role)
+  build-check <repo> --base <branch>       编译失败归类决策 (stdin 读 build log)
+  config-gen --repo-path ... --platform ... 生成 OpenSpec config.yaml
+  submit iteration probe <repo>            探测平台 + module-id + sprints
+  submit iteration apply <repo> --branch ... 关联迭代 + 触发打包
+  defect probe                             探测 huoban/dima 可用性
+  defect query [--product wallet]          双源查询缺陷列表
+  defect get <id> --source huoban|dima     拉取单个缺陷详情
+
+详见 $SKILL_BASE/lib/CONTRACTS.md
+EOF
+        ;;
+    *)
+        echo "zai-junior: unknown subcommand '$1'" >&2
+        echo "Run 'zai-junior --help' for usage." >&2
+        exit 1
+        ;;
+esac

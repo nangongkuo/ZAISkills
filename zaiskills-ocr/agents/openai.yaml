@@ -1,0 +1,4 @@
+interface:
+  display_name: "ZAISkills-OCR"
+  short_description: "ZAISkills 图片OCR归档、素材留存与文件还原流程"
+  default_prompt: "Use $zaiskills-ocr to extract exactly line by line from local screenshots into ZAISkills files. Archive source images under 素材/<target-top-level-dir>/, build a source-image map first (image -> target file, visible line range, last content line, editor blank cursor status), verify each mapped range and overlap with nl -ba after writing, and do not deliver as complete if any fixable mismatch remains. Do not rely on wc -l or syntax checks as the delivery gate."

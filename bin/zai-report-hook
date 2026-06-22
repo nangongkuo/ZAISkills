@@ -1,0 +1,45 @@
+#!/bin/bash
+
+# acs-report-hook: Claude Code / Codex hook 入口
+# 仅处理 UserPromptSubmit 时机：用户敲 /acs-xxx 时建本地 trace span
+# 用法（在 settings.local.json / .codex/hooks.json 的 hooks.command 里）：
+#   acs-report-hook prompt   # UserPromptSubmit → 匹配 /acs-xxx 后写本地 trace 文件
+#
+# 历史事件（start / end）保留为 no-op，避免老配置在迁移前触发非零退出污染主链路。
+
+# 埋点失败永远不能影响主链路
+set +e
+
+EVENT="${1:-prompt}"
+PAYLOAD=$(cat)
+
+# 非 prompt 事件：no-op 兜底（PreToolUse/PostToolUse 老注册已废弃）
+[ "$EVENT" = "prompt" ] || exit 0
+
+# 解析用户原始输入，匹配 /acs-xxx 斜杠命令
+SKILL=$(printf '%s' "$PAYLOAD" | node -e "
+let s = '';
+process.stdin.on('data', c => s += c);
+process.stdin.on('end', () => {
+  try {
+    const j = JSON.parse(s);
+    const p = (j.prompt || '').trim();
+    const m = p.match(/^\/(acs-[A-Za-z0-9_-]+)/);
+    if (m) process.stdout.write(m[1]);
+  } catch (e) { /* 静默失败 */ }
+});
+" 2>/dev/null)
+
+# 不命中或解析失败一律静默退出
+[ -z "$SKILL" ] && exit 0
+
+# 定位同目录下的 acs-trace
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
+ACS_TRACE="$SCRIPT_DIR/acs-trace"
+[ -x "$ACS_TRACE" ] || exit 0
+
+# 同步执行：acs-trace init 是毫秒级本地文件 IO
+# 幂等由 acs-trace init 内部实现（同名 skill 短时窗内复用现有 span）
+"$ACS_TRACE" init --skill "$SKILL" >/dev/null 2>&1
+
+exit 0

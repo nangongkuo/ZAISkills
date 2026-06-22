@@ -1,0 +1,403 @@
+#!/usr/bin/env node
+'use strict';
+
+// acs-trace: ACS skill 调用埋点编排 CLI
+// 设计文档：/Users/ningyi/.codefuse/engine/cc/plans/buzzing-chasing-gadget.md
+//
+// 用法：
+//   acs-trace init      [--skill <name>]
+//   acs-trace intent    <task_type>
+//   acs-trace business  <ability> <key=value> [<key=value> ...]
+//   acs-trace business  <ability> <key> --json '<JSON 字符串>'
+//   acs-trace stage     <agent> <start|end>
+//   acs-trace end       [--status completed|failed] [--error <msg>]
+//   acs-trace drain
+//
+// 所有写入操作默认作用于“当前活跃 span”（mtime 最新且未 ended 的文件）。
+// 可通过 --trace-id / --span-id 显式指定。
+// 任何异常都 swallow + exit 0，绝不阻塞主链路。
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const { execFileSync } = require('child_process');
+
+const TRACE_ROOT = path.join(os.homedir(), '.acs', 'trace');
+const FAILED_DIR = path.join(TRACE_ROOT, '_failed');
+const MAX_RETRY = 3;
+const REPORT_TIMEOUT_MS = 5000;
+const INIT_DEDUP_MS = 2000;
+
+process.on('uncaughtException', () => process.exit(0));
+process.on('unhandledRejection', () => process.exit(0));
+
+function ensureDir(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function nowMs() {
+  return Date.now();
+}
+
+function newId() {
+  return crypto.randomUUID();
+}
+
+function parseFlags(argv) {
+  const positional = [];
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) {
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith('--')) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+  return { positional, flags };
+}
+
+function parseKVPair(s) {
+  const idx = s.indexOf('=');
+  if (idx < 0) return { key: s, value: '' };
+  return { key: s.slice(0, idx), value: s.slice(idx + 1) };
+}
+
+function spanFilePath(traceId, spanId) {
+  return path.join(TRACE_ROOT, traceId, `${spanId}.jsonl`);
+}
+
+function appendLine(filePath, obj) {
+  ensureDir(path.dirname(filePath));
+  fs.appendFileSync(filePath, JSON.stringify(obj) + '\n');
+}
+
+function parseSpanFile(filePath) {
+  let content;
+  try {
+    content = fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return [];
+  }
+  const events = [];
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      // 容忍坏行
+    }
+  }
+  return events;
+}
+
+function fileHasEvent(filePath, event) {
+  return parseSpanFile(filePath).some(e => e.event === event);
+}
+
+function findActiveSpanFile() {
+  if (!fs.existsSync(TRACE_ROOT)) return null;
+  const candidates = [];
+  for (const entry of fs.readdirSync(TRACE_ROOT)) {
+    if (entry.startsWith('_')) continue;
+    const fullDir = path.join(TRACE_ROOT, entry);
+    let stat;
+    try { stat = fs.statSync(fullDir); } catch { continue; }
+    if (!stat.isDirectory()) continue;
+    for (const fname of fs.readdirSync(fullDir)) {
+      if (!fname.endsWith('.jsonl')) continue;
+      const filePath = path.join(fullDir, fname);
+      let fstat;
+      try { fstat = fs.statSync(filePath); } catch { continue; }
+      if (fileHasEvent(filePath, 'ended')) continue;
+      candidates.push({ filePath, mtime: fstat.mtimeMs });
+    }
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  return candidates[0].filePath;
+}
+
+function resolveSpanFile(flags) {
+  if (flags['trace-id'] && flags['span-id']) {
+    const fp = spanFilePath(flags['trace-id'], flags['span-id']);
+    return fs.existsSync(fp) ? fp : null;
+  }
+  return findActiveSpanFile();
+}
+
+function composeSpan(filePath, events) {
+  const init = events.find(e => e.event === 'init') || {};
+  const ended = events.find(e => e.event === 'ended');
+  let mtimeMs = nowMs();
+  try { mtimeMs = fs.statSync(filePath).mtimeMs; } catch {}
+
+  const span = {
+    trace_id: init.trace_id || null,
+    skill: init.skill || null,
+    started_at: init.started_at || null,
+  };
+
+  if (ended) {
+    span.ended_at = ended.ended_at || Math.round(mtimeMs);
+    span.status = ended.status || 'completed';
+    if (ended.error) span.error = ended.error;
+  } else {
+    span.ended_at = Math.round(mtimeMs);
+    span.status = 'abandoned';
+  }
+
+  if (typeof span.started_at === 'number' && typeof span.ended_at === 'number') {
+    span.duration_ms = span.ended_at - span.started_at;
+  }
+
+  const intentEvent = events.find(e => e.event === 'intent' && e.value);
+  if (intentEvent) span.intent = intentEvent.value;
+
+  const business = {};
+  for (const e of events) {
+    if (e.event !== 'business') continue;
+    if (!e.ability || !e.key) continue;
+    if (!business[e.ability]) business[e.ability] = {};
+    business[e.ability][e.key] = e.value;
+  }
+  if (Object.keys(business).length > 0) span.business = business;
+
+  const stageMap = {};
+  for (const e of events) {
+    if (e.event !== 'stage' || !e.name) continue;
+    if (!stageMap[e.name]) stageMap[e.name] = { agent: e.name };
+    if (e.phase === 'start') stageMap[e.name].start_at = e.at;
+    if (e.phase === 'end') stageMap[e.name].end_at = e.at;
+  }
+  const stages = Object.values(stageMap).map(s => {
+    const entry = { agent: s.agent };
+    if (s.start_at) entry.start_at = s.start_at;
+    if (s.end_at) entry.end_at = s.end_at;
+    return entry;
+  });
+  if (stages.length > 0) span.stages = stages;
+
+  return span;
+}
+
+function getRetryCount(events) {
+  return events.filter(e => e.event === 'report_failed').length;
+}
+
+function locateAcsReport() {
+  let scriptPath = process.argv[1];
+  try { scriptPath = fs.realpathSync(scriptPath); } catch {}
+  return path.join(path.dirname(scriptPath), 'acs-report');
+}
+
+// --- 子命令 ---
+
+function cmdInit(args) {
+  const { flags } = parseFlags(args);
+  const skill = flags.skill || '';
+
+  // 幂等：同名 skill 在 INIT_DEDUP_MS 窗口内已有活跃 span 则复用
+  if (skill) {
+    const reuse = findReusableSpan(skill);
+    if (reuse) {
+      process.stdout.write(JSON.stringify({
+        trace_id: reuse.traceId,
+        span_id: reuse.spanId,
+        reused: true,
+      }) + '\n');
+      return;
+    }
+  }
+
+  const traceId = newId();
+  const spanId = newId();
+  const initEvent = {
+    event: 'init',
+    trace_id: traceId,
+    span_id: spanId,
+    skill,
+    started_at: nowMs(),
+  };
+
+  appendLine(spanFilePath(traceId, spanId), initEvent);
+  process.stdout.write(JSON.stringify({ trace_id: traceId, span_id: spanId }) + '\n');
+}
+
+function findReusableSpan(skill) {
+  if (!fs.existsSync(TRACE_ROOT)) return null;
+  const now = nowMs();
+  for (const entry of fs.readdirSync(TRACE_ROOT)) {
+    if (entry.startsWith('_')) continue;
+    const fullDir = path.join(TRACE_ROOT, entry);
+    let stat;
+    try { stat = fs.statSync(fullDir); } catch { continue; }
+    if (!stat.isDirectory()) continue;
+    for (const fname of fs.readdirSync(fullDir)) {
+      if (!fname.endsWith('.jsonl')) continue;
+      const filePath = path.join(fullDir, fname);
+      const events = parseSpanFile(filePath);
+      if (events.length === 0) continue;
+      if (events.some(e => e.event === 'ended')) continue;
+      const init = events.find(e => e.event === 'init');
+      if (!init || init.skill !== skill) continue;
+      if (typeof init.started_at !== 'number') continue;
+      if (now - init.started_at > INIT_DEDUP_MS) continue;
+      return { traceId: init.trace_id, spanId: init.span_id, filePath };
+    }
+  }
+  return null;
+}
+
+function cmdBusiness(args) {
+  const { positional, flags } = parseFlags(args);
+  if (positional.length < 2) return;
+  const filePath = resolveSpanFile(flags);
+  if (!filePath) return;
+  const ability = positional[0];
+
+  // --json 模式：positional[1] 是 key，flags.json 携带 JSON 字符串
+  // 用于写入数组 / 对象等非标量值（如 knowledge: ["a.md","b.md"]）
+  if (typeof flags.json === 'string') {
+    const key = positional[1];
+    if (!key) return;
+    let value;
+    try { value = JSON.parse(flags.json); } catch { return; }
+    appendLine(filePath, { event: 'business', at: nowMs(), ability, key, value });
+    return;
+  }
+
+  for (let i = 1; i < positional.length; i++) {
+    const { key, value } = parseKVPair(positional[i]);
+    if (!key) continue;
+    appendLine(filePath, { event: 'business', at: nowMs(), ability, key, value });
+  }
+}
+
+function cmdIntent(args) {
+  const { positional, flags } = parseFlags(args);
+  if (positional.length < 1) return;
+  const filePath = resolveSpanFile(flags);
+  if (!filePath) return;
+  if (fileHasEvent(filePath, 'intent')) return;
+  appendLine(filePath, { event: 'intent', at: nowMs(), value: positional[0] });
+}
+
+function cmdStage(args) {
+  const { positional, flags } = parseFlags(args);
+  if (positional.length < 2) return;
+  const filePath = resolveSpanFile(flags);
+  if (!filePath) return;
+  const [name, phase] = positional;
+  if (phase !== 'start' && phase !== 'end') return;
+  appendLine(filePath, { event: 'stage', at: nowMs(), name, phase });
+}
+
+function cmdEnd(args) {
+  const { flags } = parseFlags(args);
+  const filePath = resolveSpanFile(flags);
+  if (!filePath) return;
+  const ended = {
+    event: 'ended',
+    ended_at: nowMs(),
+    status: flags.status || 'completed',
+  };
+  if (flags.error) ended.error = flags.error;
+  appendLine(filePath, ended);
+
+  // 正常结束后立即 drain 上报，不等下次 SessionStart
+  try { cmdDrain(); } catch {}
+}
+
+function drainOne(filePath, acsReport) {
+  const events = parseSpanFile(filePath);
+  if (events.length === 0) {
+    try { fs.unlinkSync(filePath); } catch {}
+    return;
+  }
+  // 没有 intent 的 span 数据不完整，跳过上报并清理
+  if (!events.some(e => e.event === 'intent')) {
+    try { fs.unlinkSync(filePath); } catch {}
+    return;
+  }
+  const span = composeSpan(filePath, events);
+  const skill = span.skill || 'acs-unknown';
+  const extraJson = JSON.stringify(span);
+
+  let success = false;
+  let reason = '';
+  try {
+    execFileSync(acsReport, [
+      'stats',
+      '--tool-name', skill,
+      '--event', 'span',
+      '--extra', extraJson,
+    ], { stdio: 'pipe', timeout: REPORT_TIMEOUT_MS });
+    success = true;
+  } catch (e) {
+    reason = (e && e.message) ? String(e.message).slice(0, 200) : 'unknown';
+  }
+
+  if (success) {
+    try { fs.unlinkSync(filePath); } catch {}
+    return;
+  }
+
+  const retry = getRetryCount(events) + 1;
+  appendLine(filePath, { event: 'report_failed', at: nowMs(), retry, reason });
+  if (retry > MAX_RETRY) {
+    ensureDir(FAILED_DIR);
+    const traceId = path.basename(path.dirname(filePath));
+    const fname = path.basename(filePath);
+    const dest = path.join(FAILED_DIR, `${traceId}_${fname}`);
+    try { fs.renameSync(filePath, dest); } catch {}
+  }
+}
+
+function cmdDrain() {
+  if (!fs.existsSync(TRACE_ROOT)) return;
+  const acsReport = locateAcsReport();
+  if (!fs.existsSync(acsReport)) return;
+
+  for (const entry of fs.readdirSync(TRACE_ROOT)) {
+    if (entry.startsWith('_')) continue;
+    const fullDir = path.join(TRACE_ROOT, entry);
+    let stat;
+    try { stat = fs.statSync(fullDir); } catch { continue; }
+    if (!stat.isDirectory()) continue;
+
+    for (const fname of fs.readdirSync(fullDir)) {
+      if (!fname.endsWith('.jsonl')) continue;
+      try { drainOne(path.join(fullDir, fname), acsReport); } catch {}
+    }
+
+    try {
+      if (fs.readdirSync(fullDir).length === 0) fs.rmdirSync(fullDir);
+    } catch {}
+  }
+}
+
+// --- 入口 ---
+
+const subcmd = process.argv[2];
+const rest = process.argv.slice(3);
+
+switch (subcmd) {
+  case 'init':      cmdInit(rest); break;
+  case 'intent':    cmdIntent(rest); break;
+  case 'business':  cmdBusiness(rest); break;
+  case 'stage':     cmdStage(rest); break;
+  case 'end':       cmdEnd(rest); break;
+  case 'drain':     cmdDrain(); break;
+  default:          break;
+}
+
+process.exit(0);
