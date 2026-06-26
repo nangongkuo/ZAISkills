@@ -1,0 +1,98 @@
+#!/bin/bash
+# huoban-mydefects: 查询主集成版本及前后各两个版本下"我经手"的缺陷
+# Usage: huoban-mydefects [product-name]
+#   product-name: 产品名称，默认 wallet
+
+set -euo pipefail
+
+PRODUCT="${1:-wallet}"
+PAGE_SIZE="${2:-20}"
+TODAY=$(date +%Y-%m-%d)
+
+echo "========================================"
+echo "产品: $PRODUCT"
+echo "查询日期: $TODAY"
+echo "========================================"
+echo ""
+
+# 获取发布计划列表
+RELEASE_JSON=$(huoban-cli release list --product-name="$PRODUCT" --page-size=50)
+
+# 确定主集成版本：找到当前日期在集成窗口内的最早版本 (latestIntegrateTime >= today)
+MAIN_VERSION=$(echo "$RELEASE_JSON" | jq -r --arg today "$TODAY" '
+  .result.list
+  | map(select(.latestIntegrateTime != null))
+  | map(select((.latestIntegrateTime | split(" ")[0]) >= $today))
+  | sort_by(.versionSort)
+  | .[0].version // ""
+')
+
+if [ -z "$MAIN_VERSION" ]; then
+  echo "未能确定当前主集成版本"
+  exit 1
+fi
+
+# 获取所有版本并按版本号排序，找到主集成版本索引
+ALL_VERSIONS=$(echo "$RELEASE_JSON" | jq -r '.result.list | sort_by(.versionSort) | .[] | .version')
+INDEX=$(echo "$ALL_VERSIONS" | grep -n "^${MAIN_VERSION}$" | head -1 | cut -d: -f1)
+
+if [ -z "$INDEX" ]; then
+  echo "未能在发布计划中找到主集成版本: $MAIN_VERSION"
+  exit 1
+fi
+
+echo "主集成版本: $MAIN_VERSION"
+echo "查询范围: 前后各 1 个版本 (共 3 个)"
+echo ""
+
+# 取主集成版本前后各一个版本
+echo "$ALL_VERSIONS" | sed -n "$((INDEX-1)),$((INDEX+1))p" | while IFS= read -r version; do
+  LABEL=""
+  if [ "$version" = "$MAIN_VERSION" ]; then
+    LABEL=" [★ 主集成]"
+  fi
+
+  echo "----------------------------------------"
+  echo "版本: $version$LABEL"
+  echo "----------------------------------------"
+
+  DEFECT_JSON=$(huoban-cli defect list --product-name="$PRODUCT" --version="$version" --type=myHandle --page-size="$PAGE_SIZE")
+  COUNT=$(echo "$DEFECT_JSON" | jq -r '.result.total // 0')
+
+  if [ "$COUNT" = "0" ] || [ "$COUNT" = "null" ]; then
+    echo "  暂无缺陷"
+  else
+    echo "  共 $COUNT 个缺陷:"
+    echo ""
+
+    # defect list 返回的是精简数据，关键字段为空，需要逐个调用 defect get 补全
+    echo "$DEFECT_JSON" | jq -r '.result.list[].defectId' | while IFS= read -r defectId; do
+      DETAIL_JSON=$(huoban-cli defect get --id="$defectId")
+      # defect get 返回 result 数组，取第一个元素
+      DETAIL=$(echo "$DETAIL_JSON" | jq '.result | if type == "array" then .[0] else . end')
+      if [ "$DETAIL" = "null" ] || [ -z "$DETAIL" ]; then
+        echo "  • 缺陷ID: $defectId (查询详情失败)"
+        echo ""
+        continue
+      fi
+      echo "$DETAIL" | jq -r '
+      "  • 缺陷ID: " + .defectId + "\n" +
+      "    标题: " + (.title // "未填写") + "\n" +
+      "    状态: " + (.status.name // "未知") + "\n" +
+      "    优先级: " + (.priority.name // "未知") + "\n" +
+      "    严重程度: " + (.severity.name // "未知") + "\n" +
+      "    平台: " + (.platform.name // "未知") + "\n" +
+      "    分类: " + (.classify.name // "未知") + "\n" +
+      "    模块: " + (.module.name // "未知") + "\n" +
+      "    创建人: " + (.reporterDisplayName // "未知") + "\n" +
+      "    指派给: " + (.assignerDisplayName // "未指派") + "\n" +
+      "    处理人: " + (.handlerDisplayName // "未指派") + "\n" +
+      "    客户端版本: " + (.clientVersion // "未知") + "\n" +
+      "    描述: " + (.description // "无") + "\n" +
+      "    创建时间: " + .createTime + "\n"'
+    done
+  fi
+  echo ""
+done
+
+echo "查询完成"
